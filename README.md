@@ -120,14 +120,17 @@ cawk -F, 'NR>1{print $1, "age:", $2}' data.csv
 go build -o cawk .
 ```
 
-Or with goyacc if you modify the grammar (see `Makefile`):
+The generated parser `awk.go` is committed, so no extra tools are needed for a plain build.
+
+To regenerate it after editing the grammar (`awk.go.y`):
 
 ```bash
 go install golang.org/x/tools/cmd/goyacc@latest
-make
+go generate
+go build -o cawk .
 ```
 
-The grammar is in `awk.go.y` (named with `.go.y` for editor syntax highlighting; goyacc generates `awk.go` from it).
+The grammar lives in `awk.go.y` (the `.go.y` extension gives editors Go-flavoured syntax highlighting on the yacc source).
 
 ## Testing
 
