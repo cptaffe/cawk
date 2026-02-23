@@ -1,0 +1,143 @@
+package main
+
+import "fmt"
+
+// itemType identifies the type of lexed item (internal to the lexer).
+type itemType int
+
+const (
+	itemError itemType = 256 + iota // error; val is error text (start above ASCII)
+	itemEOF
+	itemNewline // significant newline (statement terminator)
+
+	// Literals
+	itemNumber
+	itemString
+	itemRegex
+	itemIdent
+
+	// Structural regex keywords (context-sensitive: only when followed by /)
+	itemX // x/regex/
+	itemY // y/regex/
+	itemG // g/regex/
+	itemV // v/regex/
+
+	// Keywords
+	itemBegin
+	itemEnd
+	itemIf
+	itemElse
+	itemWhile
+	itemFor
+	itemDo
+	itemIn
+	itemDelete
+	itemPrint
+	itemPrintf
+	itemGetline
+	itemReturn
+	itemBreak
+	itemContinue
+	itemNext
+	itemNextfile
+	itemExit
+	itemFunction
+
+	// Two-character operators
+	itemAnd        // &&
+	itemOr         // ||
+	itemAppend     // >>
+	itemLE         // <=
+	itemGE         // >=
+	itemEQ         // ==
+	itemNE         // !=
+	itemMatch      // ~
+	itemNoMatch    // !~
+	itemIncr       // ++
+	itemDecr       // --
+	itemPow        // ^ (also **)
+	itemAddAssign  // +=
+	itemSubAssign  // -=
+	itemMulAssign  // *=
+	itemDivAssign  // /=
+	itemModAssign  // %=
+	itemPowAssign  // ^=
+	itemPipeAppend // |&
+
+	// Single-character tokens are their ASCII value; multi-char above.
+	// These are just symbolic names:
+	itemLParen    // (
+	itemRParen    // )
+	itemLBrace    // {
+	itemRBrace    // }
+	itemLBracket  // [
+	itemRBracket  // ]
+	itemSemicolon // ;
+	itemComma     // ,
+	itemDollar    // $
+	itemQuestion  // ?
+	itemColon     // :
+	itemBang      // !
+	itemPlus      // +
+	itemMinus     // -
+	itemStar      // *
+	itemSlash     // /
+	itemPercent   // %
+	itemLT        // <
+	itemGT        // >
+	itemPipe      // |
+	itemCaret     // ^
+)
+
+// item represents a token returned from the scanner.
+type item struct {
+	typ itemType // The type of this item.
+	val string   // The value of this item (slice of input).
+	pos int      // The position of this item in the input.
+	line int     // The line number of this item.
+}
+
+func (i item) String() string {
+	switch i.typ {
+	case itemEOF:
+		return "EOF"
+	case itemError:
+		return fmt.Sprintf("ERROR(%s)", i.val)
+	case itemNewline:
+		return "NEWLINE"
+	}
+	if len(i.val) > 20 {
+		return fmt.Sprintf("%.20q...", i.val)
+	}
+	return fmt.Sprintf("%q", i.val)
+}
+
+var keywords = map[string]itemType{
+	"BEGIN":    itemBegin,
+	"END":      itemEnd,
+	"if":       itemIf,
+	"else":     itemElse,
+	"while":    itemWhile,
+	"for":      itemFor,
+	"do":       itemDo,
+	"in":       itemIn,
+	"delete":   itemDelete,
+	"print":    itemPrint,
+	"printf":   itemPrintf,
+	"getline":  itemGetline,
+	"return":   itemReturn,
+	"break":    itemBreak,
+	"continue": itemContinue,
+	"next":     itemNext,
+	"nextfile": itemNextfile,
+	"exit":     itemExit,
+	"function": itemFunction,
+}
+
+// structuralKeywords maps single-letter structural regex commands.
+var structuralKeywords = map[string]itemType{
+	"x": itemX,
+	"y": itemY,
+	"g": itemG,
+	"v": itemV,
+}

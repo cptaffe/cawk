@@ -1,0 +1,5 @@
+# Compiled binary
+cawk
+
+# goyacc debug output
+y.output
