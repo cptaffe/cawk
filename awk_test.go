@@ -458,3 +458,31 @@ END {
 `
 	check(t, "multiline", runCawk(t, prog, "a:10\nb:20\nc:30\n"), "3 20\n")
 }
+
+// --- Structural regex: break/continue/next control flow ---
+
+func TestStructuralControlFlow(t *testing.T) {
+	// break exits the match loop but outer rule continues
+	check(t, "x_break",
+		runCawk(t, `{ x/[0-9]+/ { if($0=="2")break; print "m:"$0 }; print "end" }`,
+			"a 1 b 2 c 3\n"),
+		"m:1\nend\n")
+
+	// continue skips to the next match
+	check(t, "x_continue",
+		runCawk(t, `{ x/[0-9]+/ { if($0=="2")continue; print "m:"$0 }; print "end" }`,
+			"a 1 b 2 c 3\n"),
+		"m:1\nm:3\nend\n")
+
+	// next skips the whole record; outer rule does not run
+	check(t, "x_next",
+		runCawk(t, `{ x/[0-9]+/ { if($0=="2")next; print "m:"$0 }; print "end" }`,
+			"a 1 b 2 c 3\nfoo\n"),
+		"m:1\nend\n") // line2 "foo" produces just "end"
+
+	// nested break: inner break only exits the inner loop
+	check(t, "x_nested_break",
+		runCawk(t, `{ x/[0-9][a-z][0-9]/ { x/[0-9]+/ { if($0=="2")break; print $0 }; print "---" } }`,
+			"1a2 3b4\n"),
+		"1\n---\n3\n4\n---\n")
+}
