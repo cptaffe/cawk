@@ -1,4 +1,3 @@
-// awk_test.go — cawk tests based on busybox awk test suite + plan9port awk
 package main
 
 import (
@@ -8,481 +7,545 @@ import (
 	"testing"
 )
 
-// runCawk runs the cawk binary with the given program and stdin, returns stdout.
-func runCawk(t *testing.T, prog string, stdin string, args ...string) string {
+// runCawk runs a cawk program against input and returns stdout.
+func runCawk(t *testing.T, prog, input string, args ...string) string {
 	t.Helper()
-	cmdArgs := []string{"run", "."}
-	cmdArgs = append(cmdArgs, args...)
-	cmdArgs = append(cmdArgs, prog)
-	cmd := exec.Command("go", cmdArgs...)
-	cmd.Stdin = strings.NewReader(stdin)
-	cmd.Dir, _ = os.Getwd()
+	cmd := exec.Command("./cawk", append([]string{prog}, args...)...)
+	cmd.Stdin = strings.NewReader(input)
 	out, err := cmd.Output()
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
-			t.Fatalf("cawk error: %v\nstderr: %s", err, ee.Stderr)
+			t.Logf("stderr: %s", ee.Stderr)
 		}
-		t.Fatalf("cawk failed: %v", err)
+		t.Fatalf("cawk error: %v", err)
 	}
 	return string(out)
-}
-
-func runCawkFS(t *testing.T, prog, fs, stdin string) string {
-	t.Helper()
-	return runCawk(t, prog, stdin, "-F", fs)
 }
 
 func check(t *testing.T, name, got, want string) {
 	t.Helper()
 	if got != want {
-		t.Errorf("%s:\n  got:  %q\n  want: %q", name, got, want)
+		t.Errorf("%s:\ngot:  %q\nwant: %q", name, got, want)
 	}
 }
 
-// --- Busybox awk: FS tests ---
-
-func TestFS(t *testing.T) {
-	// NF for various inputs with FS=[#]
-	check(t, "NF empty", runCawkFS(t, "{print NF}", "[#]", ""), "")
-	check(t, "NF newline", runCawkFS(t, "{print NF}", "[#]", "\n"), "0\n")
-	check(t, "NF #", runCawkFS(t, "{print NF}", "[#]", "#\n"), "2\n")
-	check(t, "NF #abc#", runCawkFS(t, "{print NF}", "[#]", "#abc#\n"), "3\n")
-}
-
-// --- Arithmetic ---
-
-func TestArithmetic(t *testing.T) {
-	tests := []struct{ name, prog, want string }{
-		{"add", "BEGIN{print 4+3}", "7\n"},
-		{"sub", "BEGIN{print 4-3}", "1\n"},
-		{"mul", "BEGIN{print 2*3}", "6\n"},
-		{"div", "BEGIN{print 6/2}", "3\n"},
-		{"mod", "BEGIN{print 10%3}", "1\n"},
-		{"pow", "BEGIN{print 2^10}", "1024\n"},
-		{"unary_neg", "BEGIN{print -5}", "-5\n"},
-		{"parens", "BEGIN{print (2+3)*4}", "20\n"},
-		{"pow_sub", "BEGIN{print (2^31)-1}", "2147483647\n"},
-		{"float", "BEGIN{print 1.5+2.5}", "4\n"},
-		{"precedence", "BEGIN{print 2+3*4}", "14\n"},
+// Build the binary once before all tests.
+func TestMain(m *testing.M) {
+	cmd := exec.Command("go", "build", "-o", "cawk", ".")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		os.Exit(1)
 	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			check(t, tc.name, runCawk(t, tc.prog, ""), tc.want)
-		})
-	}
+	os.Exit(m.Run())
 }
 
-// --- String operations ---
+// ─── 5.1  Stream scanner: /re/ is x-expression ───────────────────────────────
 
-func TestStringOps(t *testing.T) {
-	check(t, "concat", runCawk(t, `BEGIN{print "hello" " " "world"}`, ""), "hello world\n")
-	check(t, "concat_var", runCawk(t, `BEGIN{a="foo"; b="bar"; print a b}`, ""), "foobar\n")
-	check(t, "length", runCawk(t, `BEGIN{print length("hello")}`, ""), "5\n")
-	check(t, "substr", runCawk(t, `BEGIN{print substr("hello",2,3)}`, ""), "ell\n")
-	check(t, "index", runCawk(t, `BEGIN{print index("hello","ll")}`, ""), "3\n")
-	check(t, "split", runCawk(t, `BEGIN{n=split("a:b:c",arr,":"); print n, arr[1], arr[2], arr[3]}`, ""), "3 a b c\n")
-	check(t, "toupper", runCawk(t, `BEGIN{print toupper("hello")}`, ""), "HELLO\n")
-	check(t, "tolower", runCawk(t, `BEGIN{print tolower("WORLD")}`, ""), "world\n")
-	check(t, "sprintf", runCawk(t, `BEGIN{print sprintf("%05d", 42)}`, ""), "00042\n")
-	check(t, "gsub", runCawk(t, `BEGIN{s="aaa"; gsub(/a/,"b",s); print s}`, ""), "bbb\n")
-	check(t, "sub", runCawk(t, `BEGIN{s="aaa"; sub(/a/,"b",s); print s}`, ""), "baa\n")
-	check(t, "match", runCawk(t, `BEGIN{print match("hello",/ll/)}`, ""), "3\n")
+// /re/ fires for each match of re in the stream — not per line.
+// $0 = exactly the matched text.
+func TestXSemantics(t *testing.T) {
+	check(t, "x-semantics: each word is its own $0",
+		runCawk(t, `/[a-z]+/ { print $0 }`, "hello world\n"),
+		"hello\nworld\n")
 }
 
-// --- Fields ---
-
-func TestFields(t *testing.T) {
-	check(t, "$1", runCawk(t, `{print $1}`, "hello world\n"), "hello\n")
-	check(t, "$2", runCawk(t, `{print $2}`, "hello world\n"), "world\n")
-	check(t, "NF", runCawk(t, `{print NF}`, "a b c\n"), "3\n")
-	check(t, "last_field", runCawk(t, `{print $NF}`, "a b c\n"), "c\n")
-	check(t, "FS_tab", runCawkFS(t, `{print $2}`, "\t", "a\tb\tc\n"), "b\n")
-	check(t, "FS_single", runCawkFS(t, `{print NF}`, ":", "a:b:c\n"), "3\n")
-	check(t, "modify_field", runCawk(t, `{$2="X"; print}`, "a b c\n"), "a X c\n")
-	check(t, "NF_reduce", runCawk(t, `{NF=2; print}`, "a b c d\n"), "a b\n")
-	check(t, "OFS", runCawk(t, `BEGIN{OFS="-"} {$1=$1; print}`, "a b c\n"), "a-b-c\n")
+// Bytes that don't match any rule are silently advanced one byte.
+func TestXAdvancesStream(t *testing.T) {
+	check(t, "digits silently advance",
+		runCawk(t, `/[a-z]+/ { print $0 }`, "abc 123 def\n"),
+		"abc\ndef\n")
 }
 
-// --- Patterns ---
-
-func TestPatterns(t *testing.T) {
-	input := "apple\nbanana\ncherry\n"
-	check(t, "regex_pat", runCawk(t, `/an/{print}`, input), "banana\n")
-	check(t, "neg_pat", runCawk(t, `!/an/{print}`, input), "apple\ncherry\n")
-	check(t, "expr_pat", runCawk(t, `NR==2{print}`, input), "banana\n")
-	check(t, "range_pat", runCawk(t, `/apple/,/cherry/{print}`, input), "apple\nbanana\ncherry\n")
+// First matching rule wins; later rules never see the same bytes.
+func TestFirstRuleWins(t *testing.T) {
+	check(t, "first rule wins",
+		runCawk(t, `/abc/{print "ABC"} /[a-z]+/{print "word:", $0}`,
+			"abc xyz abc\n"),
+		"ABC\nword: xyz\nABC\n")
 }
 
-// --- Control flow ---
-
-func TestControlFlow(t *testing.T) {
-	check(t, "if", runCawk(t, `BEGIN{if(1)print "yes"}`, ""), "yes\n")
-	check(t, "if_else", runCawk(t, `BEGIN{if(0) print "no" else print "yes"}`, ""), "yes\n")
-	check(t, "while", runCawk(t, `BEGIN{i=1;while(i<=3){print i;i++}}`, ""), "1\n2\n3\n")
-	check(t, "for", runCawk(t, `BEGIN{for(i=1;i<=3;i++)print i}`, ""), "1\n2\n3\n")
-	check(t, "for_in", runCawk(t, `BEGIN{a[1]=1;a[2]=2;n=0;for(k in a)n++;print n}`, ""), "2\n")
-	check(t, "do_while", runCawk(t, `BEGIN{i=1;do{print i;i++}while(i<=3)}`, ""), "1\n2\n3\n")
-	check(t, "next", runCawk(t, `/b/{next}{print}`, "a\nb\nc\n"), "a\nc\n")
-	check(t, "break", runCawk(t, `BEGIN{for(i=1;i<=5;i++){if(i==3)break;print i}}`, ""), "1\n2\n")
-	check(t, "continue", runCawk(t, `BEGIN{for(i=1;i<=5;i++){if(i==3)continue;print i}}`, ""), "1\n2\n4\n5\n")
+// Multi-line pattern matches atomically.
+func TestMultiLinePattern(t *testing.T) {
+	check(t, "two-line match",
+		runCawk(t, `/foo\nbar\n/{print "MATCH"} {print "line:", $0}`,
+			"foo\nbar\nbaz\n"),
+		"MATCH\nline: baz\n")
 }
 
-// --- Arrays ---
+// When multi-line pattern does not match, lines fall through to bare block.
+func TestMultiLinePatternFallthrough(t *testing.T) {
+	check(t, "no chord",
+		runCawk(t, `/foo\nbar\n/{print "CHORD"} {print "line:", $0}`,
+			"foo\nqux\n"),
+		"line: foo\nline: qux\n")
+}
+
+// Hotkey daemon example: multi-line patterns race against line-based catch-all.
+func TestHotkeyDaemonPattern(t *testing.T) {
+	input := "alt x\nz\nalt x\nq\nctrl c\n"
+	check(t, "hotkey",
+		runCawk(t, `/alt x\nz\n/{print "chord:alt-x-z"} /ctrl c\n/{print "quit"} {print "key:"$0}`,
+			input),
+		"chord:alt-x-z\nkey:alt x\nkey:q\nquit\n")
+}
+
+// ─── 5.1 (cont.)  Implicit scanner: bare block ───────────────────────────────
+
+// Bare block { } is the AWK-compat line scanner: $0 = line without trailing \n.
+func TestImplicitScanner(t *testing.T) {
+	check(t, "bare block line scanner",
+		runCawk(t, `{ print ">>", $0 }`, "a\nb\nc\n"),
+		">> a\n>> b\n>> c\n")
+}
+
+// Bare block gives $0 without the trailing newline.
+func TestImplicitScannerNoBareNewline(t *testing.T) {
+	check(t, "no trailing newline in $0",
+		runCawk(t, `{ print length($0) }`, "hello\n"),
+		"5\n")
+}
+
+// Explicit /[^\n]*\n/ includes the newline in $0; bare block does not.
+func TestImplicitVsExplicit(t *testing.T) {
+	check(t, "explicit /[^\\n]*\\n/ includes newline",
+		runCawk(t, `/[^\n]*\n/ { print length($0) }`, "hello\n"),
+		"6\n")
+}
+
+// Bare block and explicit /re/ can coexist; /re/ consumes first.
+func TestNoPatternAndRegexCoexist(t *testing.T) {
+	check(t, "mixed rules",
+		runCawk(t, `/foo\n/{print "FOO"} {print "other:", $0}`, "foo\nbar\nfoo\n"),
+		"FOO\nother: bar\nFOO\n")
+}
+
+// ─── 5.2  Capture groups ─────────────────────────────────────────────────────
+
+func TestPositionalGroups(t *testing.T) {
+	check(t, "date groups",
+		runCawk(t, `/([0-9]{4})-([0-9]{2})-([0-9]{2})/{print $1,$2,$3}`,
+			"2024-01-15\n"),
+		"2024 01 15\n")
+}
+
+func TestNamedGroups(t *testing.T) {
+	check(t, "named groups",
+		runCawk(t, `/(?P<y>\d{4})-(?P<m>\d{2})-(?P<d>\d{2})/{print $d"/"$m"/"$y}`,
+			"2024-01-15\n"),
+		"15/01/2024\n")
+}
+
+func TestNamedAndPositional(t *testing.T) {
+	check(t, "named and positional agree",
+		runCawk(t, `/(?P<word>[a-z]+)/{print $1, $word}`, "hello\n"),
+		"hello hello\n")
+}
+
+func TestNoCaptures(t *testing.T) {
+	// No capture groups → $1 is "" (empty string); print OFS-joins args.
+	// print "hi", "|", "" = "hi" + OFS + "|" + OFS + "" = "hi | "
+	check(t, "no captures $1 empty",
+		runCawk(t, `/[a-z]+/{print $0, "|", $1}`, "hi\n"),
+		"hi | \n")
+}
+
+func TestCaptureGroupsMultiple(t *testing.T) {
+	check(t, "multiple key=val matches",
+		runCawk(t, `/([a-z]+)=([0-9]+)/{print $1,"is",$2}`,
+			"x=1 y=2 z=3\n"),
+		"x is 1\ny is 2\nz is 3\n")
+}
+
+// ─── 5.3  Guards: if ($0 ~ /re/) ─────────────────────────────────────────────
+
+func TestGuard(t *testing.T) {
+	check(t, "guard: match",
+		runCawk(t, `{ if ($0 ~ /error/) { print "ERR:", $0 } }`,
+			"ok\nerror here\nfine\n"),
+		"ERR: error here\n")
+}
+
+func TestAntiGuard(t *testing.T) {
+	check(t, "anti-guard: no match",
+		runCawk(t, `{ if ($0 !~ /error/) { print $0 } }`,
+			"ok\nerror\nfine\n"),
+		"ok\nfine\n")
+}
+
+func TestGuardWithX(t *testing.T) {
+	// Guard inside bare block (bare block gives $0 without trailing newline).
+	check(t, "guard in bare block",
+		runCawk(t, `{ if ($0 ~ /foo/) { print "has foo:", $0 } }`,
+			"bar\nfoo here\nbaz\n"),
+		"has foo: foo here\n")
+}
+
+// ─── 5.4  Nested /re/ {} inside blocks ───────────────────────────────────────
+
+// Inner /re/ { } iterates over all matches of re within the current $0.
+func TestNestedX(t *testing.T) {
+	check(t, "nested x: words per line",
+		runCawk(t, `{ /[a-z]+/ { print $0 } }`, "hello world\nbaz\n"),
+		"hello\nworld\nbaz\n")
+}
+
+// Nested /re/ with capture groups.
+func TestNestedXCaptures(t *testing.T) {
+	check(t, "nested x: key=val captures",
+		runCawk(t, `{ /([a-z]+)=([0-9]+)/ { print $1, "→", $2 } }`,
+			"x=1 y=2 z=3\n"),
+		"x → 1\ny → 2\nz → 3\n")
+}
+
+// Nested x-expressions can combine outer and inner scanners.
+func TestNestedXY(t *testing.T) {
+	check(t, "nested /re/ inside /re/",
+		runCawk(t, `/[^\n]*\n/ { /[^ \n]+/ { print "W:", $0 } }`,
+			"one two three\n"),
+		"W: one\nW: two\nW: three\n")
+}
+
+// ─── 5.5  Match state save/restore ───────────────────────────────────────────
+
+// After a nested /re/ { } block, the outer $0/$1/... are fully restored.
+func TestMatchStateRestore(t *testing.T) {
+	check(t, "match state restored after inner loop",
+		runCawk(t, `/([^\n]+)\n/ { /([a-z]+)/ { } ; print $1 }`,
+			"hello world\n"),
+		"hello world\n")
+}
+
+// Outer $0 is unchanged after inner loop iterates and modifies inner $0.
+// Note: /([^\n]+)\n/ captures the newline into $0, so "print "outer:", $0"
+// produces a double-newline (the newline in $0 plus ORS).
+func TestNestedDollarZero(t *testing.T) {
+	// Use a bare block so $0 is the line without trailing newline — cleaner output.
+	check(t, "outer $0 unchanged by inner loop",
+		runCawk(t, `{ /[a-z]+/ { print "inner:", $0 }; print "outer:", $0 }`,
+			"hello world\n"),
+		"inner: hello\ninner: world\nouter: hello world\n")
+}
+
+// $0 assignment persists within the same action block.
+func TestDollarZeroAssign(t *testing.T) {
+	check(t, "$0 assignment",
+		runCawk(t, `{ $0 = toupper($0); print }`, "hello\n"),
+		"HELLO\n")
+}
+
+// ─── 5.6  y// extension (gap iteration) ──────────────────────────────────────
+
+func TestY(t *testing.T) {
+	// Gaps between digit runs in "a1b2c" = "a", "b", "c".
+	check(t, "y// gaps",
+		runCawk(t, `{ y/[0-9]+/ { print $0 } }`, "a1b2c\n"),
+		"a\nb\nc\n")
+}
+
+// y// always includes the trailing gap, even if empty.
+func TestYTrailingGap(t *testing.T) {
+	// "abc123def456" has an empty trailing gap after "456".
+	check(t, "y// empty trailing gap",
+		runCawk(t, `BEGIN{x="abc123def456"} { y/[0-9]+/ { print "|"$0"|" } }`,
+			"abc123def456\n"),
+		"|abc|\n|def|\n||\n")
+}
+
+func TestYVsX(t *testing.T) {
+	// Split on commas: gaps are the fields.
+	check(t, "y// split on comma",
+		runCawk(t, `{ y/,/ { print $0 } }`, "a,b,c\n"),
+		"a\nb\nc\n")
+}
+
+// break works inside y//.
+func TestYBreak(t *testing.T) {
+	check(t, "y break",
+		runCawk(t, `{ y/[0-9]+/ { if ($0 == "b") break; print $0 } }`, "a1b2c\n"),
+		"a\n")
+}
+
+// ─── 5.7  AWK compatibility ───────────────────────────────────────────────────
+
+func TestBeginEnd(t *testing.T) {
+	check(t, "BEGIN END",
+		runCawk(t, `BEGIN{print "start"} /[^\n]*\n/{} END{print "end"}`, "x\n"),
+		"start\nend\n")
+}
+
+func TestBeginOnly(t *testing.T) {
+	check(t, "BEGIN only",
+		runCawk(t, `BEGIN{print "hello"}`, ""),
+		"hello\n")
+}
+
+func TestCountLines(t *testing.T) {
+	check(t, "count lines",
+		runCawk(t, `BEGIN{n=0} {n++} END{print n}`, "a\nb\nc\n"),
+		"3\n")
+}
+
+func TestEndSums(t *testing.T) {
+	check(t, "sum numbers",
+		runCawk(t, `BEGIN{s=0} /[0-9]+/{s+=$0} END{print s}`, "1\n2\n3\n"),
+		"6\n")
+}
 
 func TestArrays(t *testing.T) {
-	check(t, "basic", runCawk(t, `BEGIN{a["x"]=1;a["y"]=2;print a["x"],a["y"]}`, ""), "1 2\n")
-	check(t, "numeric_key", runCawk(t, `BEGIN{a[1]=10;a[2]=20;print a[1]+a[2]}`, ""), "30\n")
-	check(t, "in_op", runCawk(t, `BEGIN{a["k"]=1;print ("k" in a),("z" in a)}`, ""), "1 0\n")
-	check(t, "delete", runCawk(t, `BEGIN{a[1]=1;a[2]=2;delete a[1];print (1 in a),(2 in a)}`, ""), "0 1\n")
-	check(t, "multi_dim", runCawk(t, `BEGIN{a[1,2]=42;print a[1,2]}`, ""), "42\n")
-	check(t, "asorti", runCawk(t, `BEGIN{a["b"]=2;a["a"]=1;n=asorti(a,b);print n,b[1],b[2]}`, ""), "2 a b\n")
+	check(t, "array freq",
+		runCawk(t, `/([a-z]+)/{a[$1]++} END{print a["a"],a["b"],a["c"]}`, "a b a c b a\n"),
+		"3 2 1\n")
 }
 
-// --- Built-in functions ---
-
-func TestBuiltins(t *testing.T) {
-	check(t, "sin", runCawk(t, `BEGIN{printf "%.4f\n", sin(0)}`, ""), "0.0000\n")
-	check(t, "cos", runCawk(t, `BEGIN{printf "%.4f\n", cos(0)}`, ""), "1.0000\n")
-	check(t, "atan2", runCawk(t, `BEGIN{printf "%.4f\n", atan2(1,1)}`, ""), "0.7854\n")
-	check(t, "exp", runCawk(t, `BEGIN{printf "%.4f\n", exp(1)}`, ""), "2.7183\n")
-	check(t, "log", runCawk(t, `BEGIN{printf "%.4f\n", log(exp(1))}`, ""), "1.0000\n")
-	check(t, "sqrt", runCawk(t, `BEGIN{print sqrt(4)}`, ""), "2\n")
-	check(t, "int_trunc", runCawk(t, `BEGIN{print int(3.9)}`, ""), "3\n")
-	check(t, "or", runCawk(t, `BEGIN{print or(3,5)}`, ""), "7\n")
-	check(t, "and", runCawk(t, `BEGIN{print and(3,5)}`, ""), "1\n")
-	check(t, "xor", runCawk(t, `BEGIN{print xor(3,5)}`, ""), "6\n")
-	check(t, "lshift", runCawk(t, `BEGIN{print lshift(1,3)}`, ""), "8\n")
-	check(t, "rshift", runCawk(t, `BEGIN{print rshift(16,2)}`, ""), "4\n")
-}
-
-// --- Printf ---
-
-func TestPrintf(t *testing.T) {
-	check(t, "%d", runCawk(t, `BEGIN{printf "%d\n", 42}`, ""), "42\n")
-	check(t, "%s", runCawk(t, `BEGIN{printf "%s\n", "hello"}`, ""), "hello\n")
-	check(t, "%f", runCawk(t, `BEGIN{printf "%.2f\n", 3.14159}`, ""), "3.14\n")
-	check(t, "%e", runCawk(t, `BEGIN{printf "%.2e\n", 1234.5}`, ""), "1.23e+03\n")
-	check(t, "%g", runCawk(t, `BEGIN{printf "%g\n", 100.0}`, ""), "100\n")
-	check(t, "%x", runCawk(t, `BEGIN{printf "%x\n", 255}`, ""), "ff\n")
-	check(t, "%o", runCawk(t, `BEGIN{printf "%o\n", 8}`, ""), "10\n")
-	check(t, "%%", runCawk(t, `BEGIN{printf "100%%\n"}`, ""), "100%\n")
-	check(t, "width", runCawk(t, `BEGIN{printf "%5d\n", 42}`, ""), "   42\n")
-	check(t, "left", runCawk(t, `BEGIN{printf "%-5d|\n", 42}`, ""), "42   |\n")
-	check(t, "star_width", runCawk(t, `BEGIN{printf "%*d\n", 5, 42}`, ""), "   42\n")
-}
-
-// --- NR and FNR ---
-
-func TestNR(t *testing.T) {
-	check(t, "NR", runCawk(t, `{print NR}`, "a\nb\nc\n"), "1\n2\n3\n")
-	check(t, "END_NR", runCawk(t, `END{print NR}`, "a\nb\n"), "2\n")
-}
-
-// --- RS handling ---
-
-func TestRS(t *testing.T) {
-	check(t, "RS_single", runCawk(t, `BEGIN{RS=":"} {print NR, $0}`, "a:b:c"), "1 a\n2 b\n3 c\n")
-}
-
-// --- Getline ---
-
-func TestGetline(t *testing.T) {
-	check(t, "getline_basic", runCawk(t, `{getline line; print line}`, "ignored\nhello\n"), "hello\n")
-}
-
-// --- OFS and ORS ---
-
-func TestOutput(t *testing.T) {
-	check(t, "OFS", runCawk(t, `BEGIN{OFS=","} {print $1,$2,$3}`, "a b c\n"), "a,b,c\n")
-	check(t, "ORS", runCawk(t, `BEGIN{ORS=";"} {print $0}`, "a\nb\n"), "a;b;")
-}
-
-// --- User-defined functions ---
-
-func TestFunctions(t *testing.T) {
-	prog := `
-function max(a,b) { return a>b ? a : b }
-BEGIN { print max(3,7), max(10,4) }
-`
-	check(t, "max", runCawk(t, prog, ""), "7 10\n")
-
-	prog2 := `
-function fact(n) { return n<=1 ? 1 : n*fact(n-1) }
-BEGIN { print fact(5) }
-`
-	check(t, "factorial", runCawk(t, prog2, ""), "120\n")
-}
-
-// --- String comparison ---
-
-func TestComparisons(t *testing.T) {
-	check(t, "str_eq", runCawk(t, `BEGIN{if("a"=="a")print "y"}`, ""), "y\n")
-	check(t, "str_lt", runCawk(t, `BEGIN{if("a"<"b")print "y"}`, ""), "y\n")
-	check(t, "num_vs_str", runCawk(t, `BEGIN{if(1=="1")print "y"}`, ""), "y\n")
-	check(t, "concat_num", runCawk(t, `BEGIN{x=3; print x "px"}`, ""), "3px\n")
-}
-
-// --- Regex match / no-match ---
-
-func TestRegex(t *testing.T) {
-	check(t, "match_op", runCawk(t, `BEGIN{if("hello"~/ell/)print "y"}`, ""), "y\n")
-	check(t, "nomatch_op", runCawk(t, `BEGIN{if("hello"!~/xyz/)print "y"}`, ""), "y\n")
-	check(t, "gsub_regex", runCawk(t, `{gsub(/[0-9]+/,"N"); print}`, "abc 123 def 456\n"), "abc N def N\n")
-}
-
-// --- Multiple rules ---
-
-func TestMultipleRules(t *testing.T) {
-	prog := `BEGIN{print "start"} {print NR, $0} END{print "end"}`
-	check(t, "multi", runCawk(t, prog, "a\nb\n"), "start\n1 a\n2 b\nend\n")
-}
-
-// --- Ternary ---
-
-func TestTernary(t *testing.T) {
-	check(t, "ternary", runCawk(t, `BEGIN{x=5; print (x>3 ? "big" : "small")}`, ""), "big\n")
-}
-
-// --- Numeric string comparison ---
-
-func TestNumericStrings(t *testing.T) {
-	// Input fields are numeric strings — compare numerically when both look numeric
-	check(t, "numstr_cmp", runCawk(t, `{if($1>$2) print "yes" else print "no"}`, "10 9\n"), "yes\n")
-}
-
-// --- sub/gsub with & ---
-
-func TestSubgsub(t *testing.T) {
-	check(t, "sub_amp", runCawk(t, `BEGIN{s="hello"; sub(/l+/,"[&]",s); print s}`, ""), "he[ll]o\n")
-	check(t, "gsub_amp", runCawk(t, `BEGIN{s="aa"; gsub(/a/,"[&]",s); print s}`, ""), "[a][a]\n")
-}
-
-// --- ARGV/ARGC ---
-
-func TestARGC(t *testing.T) {
-	check(t, "ARGC", runCawk(t, `BEGIN{print ARGC}`, ""), "1\n")
-}
-
-// --- Structural regex: x command ---
-
-func TestStructuralX(t *testing.T) {
-	// x/regex/ loops over matches in $0
-	prog := `{ x/[0-9]+/ { print $0 } }`
-	out := runCawk(t, prog, "foo 123 bar 456\n")
-	if !strings.Contains(out, "123") || !strings.Contains(out, "456") {
-		t.Errorf("x/regex/ failed: got %q", out)
-	}
-}
-
-// --- Structural regex: g/v commands ---
-
-func TestStructuralGV(t *testing.T) {
-	prog := `{g/[0-9]/{print "has digit"}}`
-	check(t, "g_cmd", runCawk(t, prog, "abc123\nxyz\n"), "has digit\n")
-
-	prog2 := `{v/[0-9]/{print "no digit"}}`
-	check(t, "v_cmd", runCawk(t, prog2, "abc123\nxyz\n"), "no digit\n")
-}
-
-// --- Pipe I/O ---
-
-func TestPipe(t *testing.T) {
-	check(t, "print_pipe", runCawk(t, `BEGIN{print "hello" | "cat"}`, ""), "hello\n")
-}
-
-// --- Deletion ---
-
-func TestDelete(t *testing.T) {
-	check(t, "delete_arr", runCawk(t, `BEGIN{a[1]=1;a[2]=2;delete a;print length(a)}`, ""), "0\n")
-}
-
-// --- exit ---
-
-func TestExit(t *testing.T) {
-	check(t, "exit_begin", runCawk(t, `BEGIN{print "a"; exit} END{print "b"}`, ""), "a\nb\n")
-}
-
-// --- Additional busybox awk tests ---
-
-func TestGetlineFile(t *testing.T) {
-	// Create temp file
-	f, err := os.CreateTemp("", "cawk_test_*.txt")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.Remove(f.Name())
-	f.WriteString("line1\nline2\nline3\n")
-	f.Close()
-
-	prog := `BEGIN{while((getline line < "` + f.Name() + `") > 0) print line}`
-	check(t, "getline_file", runCawk(t, prog, ""), "line1\nline2\nline3\n")
-}
-
-func TestGetlineCmd(t *testing.T) {
-	check(t, "getline_pipe", runCawk(t, `BEGIN{"echo hello" | getline s; print s}`, ""), "hello\n")
-}
-
-func TestPrintRedirect(t *testing.T) {
-	f, err := os.CreateTemp("", "cawk_out_*.txt")
-	if err != nil {
-		t.Fatal(err)
-	}
-	name := f.Name()
-	f.Close()
-	defer os.Remove(name)
-
-	prog := `BEGIN{print "hello" > "` + name + `"}`
-	runCawk(t, prog, "")
-	data, _ := os.ReadFile(name)
-	check(t, "print_redirect", string(data), "hello\n")
-}
-
-func TestPrintAppend(t *testing.T) {
-	f, err := os.CreateTemp("", "cawk_app_*.txt")
-	if err != nil {
-		t.Fatal(err)
-	}
-	name := f.Name()
-	f.WriteString("first\n")
-	f.Close()
-	defer os.Remove(name)
-
-	prog := `BEGIN{print "second" >> "` + name + `"}`
-	runCawk(t, prog, "")
-	data, _ := os.ReadFile(name)
-	check(t, "print_append", string(data), "first\nsecond\n")
-}
-
-func TestFieldAssign(t *testing.T) {
-	check(t, "field_extend", runCawk(t, `{$5="x"; print NF,$0}`, "a b c\n"), "5 a b c  x\n")
-	check(t, "field_rebuild", runCawk(t, `BEGIN{OFS="-"}{$1=$1; print}`, "a b c\n"), "a-b-c\n")
-	check(t, "dollar0_assign", runCawk(t, `{$0="x y z"; print NF,$1}`, "a\n"), "3 x\n")
-}
-
-func TestRangePattern(t *testing.T) {
-	input := "a\nSTART\nb\nc\nEND\nd\n"
-	check(t, "range", runCawk(t, `/START/,/END/{print}`, input), "START\nb\nc\nEND\n")
-}
-
-func TestSpecialVars(t *testing.T) {
-	check(t, "NF_field", runCawk(t, `{x=$NF; print x}`, "a b c\n"), "c\n")
-	check(t, "FILENAME", runCawk(t, `{print FILENAME}`, "x\n"), "-\n")
-}
-
-func TestArrayFunctions(t *testing.T) {
-	check(t, "length_arr", runCawk(t, `BEGIN{a[1]=1;a[2]=2;a[3]=3; print length(a)}`, ""), "3\n")
-	check(t, "multi_idx", runCawk(t, `BEGIN{a["x","y"]=42; print a["x","y"]}`, ""), "42\n")
-}
-
-func TestStringConcat(t *testing.T) {
-	check(t, "num_str", runCawk(t, `BEGIN{x=3; print x "px"}`, ""), "3px\n")
-	check(t, "str_num", runCawk(t, `BEGIN{x="v"; n=42; print x n}`, ""), "v42\n")
-	check(t, "multi_concat", runCawk(t, `BEGIN{print "a" "b" "c"}`, ""), "abc\n")
-}
-
-func TestMath(t *testing.T) {
-	check(t, "rand_range", runCawk(t, `BEGIN{srand(42); x=rand(); print (x>=0 && x<1)}`, ""), "1\n")
-	check(t, "int_floor", runCawk(t, `BEGIN{print int(-3.9)}`, ""), "-3\n")
-	check(t, "atan2_pi", runCawk(t, `BEGIN{printf "%.6f\n", atan2(0,-1)}`, ""), "3.141593\n")
-}
-
-func TestControlFlow2(t *testing.T) {
-	// Nested for with break/continue
-	prog := `BEGIN{
-		for(i=1;i<=3;i++){
-			for(j=1;j<=3;j++){
-				if(j==2)continue
-				if(i==2&&j==3)break
-				printf "%d%d\n",i,j
-			}
-		}
-	}`
-	out := runCawk(t, prog, "")
-	if !strings.Contains(out, "11") || !strings.Contains(out, "13") || !strings.Contains(out, "21") {
-		t.Errorf("nested for: got %q", out)
-	}
-}
-
-func TestPrintFormats(t *testing.T) {
-	// Number output format
-	check(t, "int_output", runCawk(t, `BEGIN{print 1.0}`, ""), "1\n")
-	check(t, "float_output", runCawk(t, `BEGIN{print 1.5}`, ""), "1.5\n")
-	check(t, "large_int", runCawk(t, `BEGIN{print 1000000}`, ""), "1000000\n")
-}
-
-func TestStructuralY(t *testing.T) {
-	// y/regex/ loops over gaps between matches
-	prog := `{ y/[0-9]+/ { printf "%s\n", $0 } }`
-	out := runCawk(t, prog, "foo 123 bar 456\n")
-	if !strings.Contains(out, "foo ") || !strings.Contains(out, " bar ") {
-		t.Errorf("y/regex/ failed: got %q", out)
-	}
-}
-
-func TestDeleteStatement(t *testing.T) {
-	// delete whole array
-	check(t, "delete_whole", runCawk(t, `BEGIN{a[1]=1;a[2]=2;delete a;print length(a)}`, ""), "0\n")
-	// delete element
-	check(t, "delete_elem", runCawk(t, `BEGIN{a[1]=1;a[2]=2;delete a[1];print (1 in a),(2 in a)}`, ""), "0 1\n")
+func TestUserFunction(t *testing.T) {
+	check(t, "user function",
+		runCawk(t, `function double(x){return x*2} /[0-9]+/{print double($0)}`,
+			"3\n7\n"),
+		"6\n14\n")
 }
 
 func TestGsub(t *testing.T) {
-	check(t, "gsub_dollar", runCawk(t, `{gsub(/a/,"b"); print}`, "aaa\n"), "bbb\n")
-	check(t, "gsub_special", runCawk(t, `BEGIN{s="a.b"; gsub(/\./,"_",s); print s}`, ""), "a_b\n")
+	check(t, "gsub",
+		runCawk(t, `{ gsub(/o/, "0"); print $0 }`, "foo bar boo\n"),
+		"f00 bar b00\n")
 }
 
-func TestFunctionRecursion(t *testing.T) {
-	prog := `
-function fib(n) {
-	if(n<=1) return n
-	return fib(n-1)+fib(n-2)
-}
-BEGIN{print fib(10)}
-`
-	check(t, "fib", runCawk(t, prog, ""), "55\n")
+func TestGsubOnDollarZero(t *testing.T) {
+	// gsub targeting $0 (via match stack) then print should reflect the change.
+	check(t, "gsub $0 then print",
+		runCawk(t, `{ gsub(/l/, "L"); print }`, "hello\n"),
+		"heLLo\n")
 }
 
-func TestMultilineProgram(t *testing.T) {
-	prog := `
-BEGIN {
-	FS = ":"
-	count = 0
-}
-{
-	count++
-	total += $2
-}
-END {
-	print count, total/count
-}
-`
-	check(t, "multiline", runCawk(t, prog, "a:10\nb:20\nc:30\n"), "3 20\n")
+func TestSplit(t *testing.T) {
+	check(t, "split",
+		runCawk(t, `BEGIN{n=split("a:b:c",a,":"); for(i=1;i<=n;i++) print a[i]}`, ""),
+		"a\nb\nc\n")
 }
 
-// --- Structural regex: break/continue/next control flow ---
+func TestGetlineFile(t *testing.T) {
+	f, _ := os.CreateTemp("", "cawk-test-*.txt")
+	f.WriteString("secret\n")
+	f.Close()
+	defer os.Remove(f.Name())
 
-func TestStructuralControlFlow(t *testing.T) {
-	// break exits the match loop but outer rule continues
-	check(t, "x_break",
-		runCawk(t, `{ x/[0-9]+/ { if($0=="2")break; print "m:"$0 }; print "end" }`,
-			"a 1 b 2 c 3\n"),
-		"m:1\nend\n")
+	check(t, "getline file",
+		runCawk(t, `BEGIN { getline line < "`+f.Name()+`"; print line }`, ""),
+		"secret\n")
+}
 
-	// continue skips to the next match
-	check(t, "x_continue",
-		runCawk(t, `{ x/[0-9]+/ { if($0=="2")continue; print "m:"$0 }; print "end" }`,
-			"a 1 b 2 c 3\n"),
-		"m:1\nm:3\nend\n")
+func TestGetlineFromPipe(t *testing.T) {
+	check(t, "getline pipe",
+		runCawk(t, `BEGIN { "echo hello" | getline x; print x }`, ""),
+		"hello\n")
+}
 
-	// next skips the whole record; outer rule does not run
-	check(t, "x_next",
-		runCawk(t, `{ x/[0-9]+/ { if($0=="2")next; print "m:"$0 }; print "end" }`,
-			"a 1 b 2 c 3\nfoo\n"),
-		"m:1\nend\n") // line2 "foo" produces just "end"
+// ─── 5.7 (cont.)  exit ───────────────────────────────────────────────────────
 
-	// nested break: inner break only exits the inner loop
-	check(t, "x_nested_break",
-		runCawk(t, `{ x/[0-9][a-z][0-9]/ { x/[0-9]+/ { if($0=="2")break; print $0 }; print "---" } }`,
-			"1a2 3b4\n"),
-		"1\n---\n3\n4\n---\n")
+func TestExit(t *testing.T) {
+	// /stop\n/ fires and calls exit; no-pattern rule has already handled "a" and "b".
+	check(t, "exit",
+		runCawk(t, `/stop\n/{exit} {print $0}`, "a\nb\nstop\nc\n"),
+		"a\nb\n")
+}
+
+func TestExitRunsEnd(t *testing.T) {
+	check(t, "exit runs END",
+		runCawk(t, `/stop\n/{exit} END{print "done"}`, "a\nstop\nb\n"),
+		"done\n")
+}
+
+// ─── 5.7 (cont.)  Arithmetic, strings, control flow ─────────────────────────
+
+func TestArithmetic(t *testing.T) {
+	check(t, "arithmetic",
+		runCawk(t, `BEGIN{print 2+3, 10/4, 2^8}`, ""),
+		"5 2.5 256\n")
+}
+
+func TestStringConcat(t *testing.T) {
+	check(t, "concat",
+		runCawk(t, `BEGIN{a="hello"; b="world"; print a " " b}`, ""),
+		"hello world\n")
+}
+
+func TestSubstr(t *testing.T) {
+	check(t, "substr",
+		runCawk(t, `BEGIN{print substr("hello world", 7)}`, ""),
+		"world\n")
+}
+
+func TestMatch(t *testing.T) {
+	check(t, "match builtin",
+		runCawk(t, `{ if (match($0, /[0-9]+/)) print "found at", RSTART }`,
+			"abc123def\n"),
+		"found at 4\n")
+}
+
+func TestPrintf(t *testing.T) {
+	check(t, "printf",
+		runCawk(t, `BEGIN{printf "%05d\n", 42}`, ""),
+		"00042\n")
+}
+
+func TestOFS(t *testing.T) {
+	check(t, "OFS",
+		runCawk(t, `BEGIN{OFS="-"; print "a","b","c"}`, ""),
+		"a-b-c\n")
+}
+
+func TestTildeOperator(t *testing.T) {
+	check(t, "~",
+		runCawk(t, `{ if ($0 ~ /foo/) { print "yes" } else { print "no" } }`,
+			"foobar\nbaz\n"),
+		"yes\nno\n")
+}
+
+func TestNomatchOperator(t *testing.T) {
+	check(t, "!~",
+		runCawk(t, `{ if ($0 !~ /foo/) print "no foo" }`, "bar\nfoo\nqux\n"),
+		"no foo\nno foo\n")
+}
+
+func TestBreakContinue(t *testing.T) {
+	check(t, "break continue",
+		runCawk(t, `BEGIN{for(i=1;i<=5;i++){if(i==3)continue; if(i==5)break; print i}}`, ""),
+		"1\n2\n4\n")
+}
+
+func TestWhileLoop(t *testing.T) {
+	check(t, "while",
+		runCawk(t, `BEGIN{i=1; while(i<=3){print i; i++}}`, ""),
+		"1\n2\n3\n")
+}
+
+func TestDoWhile(t *testing.T) {
+	check(t, "do while",
+		runCawk(t, `BEGIN{i=0; do{i++; print i}while(i<3)}`, ""),
+		"1\n2\n3\n")
+}
+
+func TestForIn(t *testing.T) {
+	check(t, "for-in sum",
+		runCawk(t, `BEGIN{a["x"]=1; a["y"]=2; for(k in a) s+=a[k]; print s}`, ""),
+		"3\n")
+}
+
+func TestForInDelete(t *testing.T) {
+	check(t, "delete array element",
+		runCawk(t, `BEGIN{a[1]=1;a[2]=2;a[3]=3; delete a[2]; print length(a)}`, ""),
+		"2\n")
+}
+
+// ─── 5.7 (cont.)  Builtins ───────────────────────────────────────────────────
+
+func TestLength(t *testing.T) {
+	check(t, "length($0)",
+		runCawk(t, `/[a-z]+/ { print length($0) }`, "hello\n"),
+		"5\n")
+}
+
+func TestTolower(t *testing.T) {
+	check(t, "tolower",
+		runCawk(t, `{ print tolower($0) }`, "Hello World\n"),
+		"hello world\n")
+}
+
+func TestToupper(t *testing.T) {
+	check(t, "toupper",
+		runCawk(t, `{ print toupper($0) }`, "hello\n"),
+		"HELLO\n")
+}
+
+func TestIndex(t *testing.T) {
+	check(t, "index",
+		runCawk(t, `BEGIN{print index("hello world", "world")}`, ""),
+		"7\n")
+}
+
+func TestSprintfBuiltin(t *testing.T) {
+	check(t, "sprintf",
+		runCawk(t, `BEGIN{s=sprintf("%.2f", 3.14159); print s}`, ""),
+		"3.14\n")
+}
+
+// ─── 5.7 (cont.)  Output, -v flag ────────────────────────────────────────────
+
+func TestOutputRedirect(t *testing.T) {
+	f, _ := os.CreateTemp("", "cawk-out-*.txt")
+	name := f.Name()
+	f.Close()
+	os.Remove(name)
+	defer os.Remove(name)
+
+	runCawk(t, `{print $0 > "`+name+`"}`, "hello\nworld\n")
+	data, _ := os.ReadFile(name)
+	check(t, "redirect >", string(data), "hello\nworld\n")
+}
+
+func TestVFlag(t *testing.T) {
+	check(t, "-v flag",
+		runCawk(t, `BEGIN{print x}`, "", "-v", "x=42"),
+		"42\n")
+}
+
+// ─── 5.8  Sparse advance ──────────────────────────────────────────────────────
+
+// Bytes not matched by any rule are silently advanced one at a time.
+func TestSparseAdvance(t *testing.T) {
+	// Uppercase runs: H (from Hello), WORLD, BAR — lowercase/spaces advanced.
+	check(t, "sparse advance",
+		runCawk(t, `/[A-Z]+/{print $0}`, "Hello WORLD foo BAR\n"),
+		"H\nWORLD\nBAR\n")
+}
+
+// ─── 5.9  Edge cases ──────────────────────────────────────────────────────────
+
+func TestEmptyInput(t *testing.T) {
+	check(t, "empty input",
+		runCawk(t, `BEGIN{print "hi"} {print $0} END{print "bye"}`, ""),
+		"hi\nbye\n")
+}
+
+func TestEOFNoNewline(t *testing.T) {
+	check(t, "EOF without newline",
+		runCawk(t, `{ print $0 }`, "hello"),
+		"hello\n")
+}
+
+// break/continue inside nested /re/ { } are scoped to the inner loop.
+func TestInnerRegexBreak(t *testing.T) {
+	check(t, "break inside /re/ {}",
+		runCawk(t, `{ /[0-9]+/ { if($0=="2")break; print $0 }; print "done" }`,
+			"1 2 3\n"),
+		"1\ndone\n")
+}
+
+func TestInnerRegexContinue(t *testing.T) {
+	check(t, "continue inside /re/ {}",
+		runCawk(t, `{ /[0-9]+/ { if($0=="2")continue; print $0 } }`, "1 2 3\n"),
+		"1\n3\n")
+}
+
+// ─── 5.10  Variables, accumulation ───────────────────────────────────────────
+
+func TestVariables(t *testing.T) {
+	check(t, "accumulate",
+		runCawk(t, `BEGIN{x=0} /[0-9]+/ { x+=$0 } END{print x}`, "10\n20\n30\n"),
+		"60\n")
+}
+
+// Condition inside bare block (replaces AWK expression pattern).
+func TestConditionInBlock(t *testing.T) {
+	check(t, "if guard in block",
+		runCawk(t, `{ if ($0 ~ /^a/) { print "a-word:", $0 } }`,
+			"apple\nbanana\napricot\n"),
+		"a-word: apple\na-word: apricot\n")
+}
+
+func TestCounterInBlock(t *testing.T) {
+	check(t, "line counter guard",
+		runCawk(t, `BEGIN{n=0} {n++; if(n==2){print "second:", $0}}`, "x\ny\nz\n"),
+		"second: y\n")
 }

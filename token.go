@@ -16,11 +16,11 @@ const (
 	itemRegex
 	itemIdent
 
+	// Named capture group reference: $name
+	itemNamedGroupRef // $identifier
+
 	// Structural regex keywords (context-sensitive: only when followed by /)
-	itemX // x/regex/
-	itemY // y/regex/
-	itemG // g/regex/
-	itemV // v/regex/
+	itemY // y/regex/ — gap iteration
 
 	// Keywords
 	itemBegin
@@ -38,8 +38,6 @@ const (
 	itemReturn
 	itemBreak
 	itemContinue
-	itemNext
-	itemNextfile
 	itemExit
 	itemFunction
 
@@ -91,10 +89,10 @@ const (
 
 // item represents a token returned from the scanner.
 type item struct {
-	typ itemType // The type of this item.
-	val string   // The value of this item (slice of input).
-	pos int      // The position of this item in the input.
-	line int     // The line number of this item.
+	typ  itemType // The type of this item.
+	val  string   // The value of this item (slice of input).
+	pos  int      // The position of this item in the input.
+	line int      // The line number of this item.
 }
 
 func (i item) String() string {
@@ -128,16 +126,13 @@ var keywords = map[string]itemType{
 	"return":   itemReturn,
 	"break":    itemBreak,
 	"continue": itemContinue,
-	"next":     itemNext,
-	"nextfile": itemNextfile,
 	"exit":     itemExit,
 	"function": itemFunction,
 }
 
-// structuralKeywords maps single-letter structural regex commands.
+// structuralKeywords: y is the only structural keyword.
+// x, g, v are removed (x-semantics are built into /re/ patterns;
+// guards use standard AWK if ($0 ~ /re/) idiom).
 var structuralKeywords = map[string]itemType{
-	"x": itemX,
 	"y": itemY,
-	"g": itemG,
-	"v": itemV,
 }
