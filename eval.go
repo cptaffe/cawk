@@ -295,51 +295,12 @@ func (interp *Interpreter) applyRangePattern(p *RangePattern, action []Stmt) {
 
 // structuralX: for each match of regex in currentText, run action with $0=match
 func (interp *Interpreter) structuralX(regex string, action []Stmt) {
-	text := interp.currentText
-	matches := structuralExtract(regex, text)
-	savedText := interp.currentText
-	savedFields := interp.fields
-	savedNF := interp.NF
-
-	for _, m := range matches {
-		matched := text[m[0]:m[1]]
-		interp.currentText = matched
-		interp.splitRecord(matched)
-		interp.execAction(action, interp.global)
-		if interp.nexting || interp.nextfiling || interp.exiting {
-			break
-		}
-	}
-
-	interp.currentText = savedText
-	interp.fields = savedFields
-	interp.NF = savedNF
+	interp.execStructural(structuralExtract(regex, interp.currentText), action, interp.global)
 }
 
 // structuralY: for each gap between matches in currentText, run action
 func (interp *Interpreter) structuralY(regex string, action []Stmt) {
-	text := interp.currentText
-	gaps := structuralGaps(regex, text)
-	savedText := interp.currentText
-	savedFields := interp.fields
-	savedNF := interp.NF
-
-	for _, g := range gaps {
-		gap := text[g[0]:g[1]]
-		if gap == "" {
-			continue
-		}
-		interp.currentText = gap
-		interp.splitRecord(gap)
-		interp.execAction(action, interp.global)
-		if interp.nexting || interp.nextfiling || interp.exiting {
-			break
-		}
-	}
-
-	interp.currentText = savedText
-	interp.fields = savedFields
-	interp.NF = savedNF
+	interp.execStructural(structuralGaps(regex, interp.currentText), action, interp.global)
 }
 
 // execAction runs a list of statements.
@@ -517,37 +478,37 @@ func (interp *Interpreter) execStmt(s Stmt, scope *Scope) {
 }
 
 func (interp *Interpreter) execXStmt(st *XStmt, scope *Scope) {
-	text := interp.currentText
-	matches := structuralExtract(st.Regex, text)
-	saved := interp.savedState()
-	for _, m := range matches {
-		matched := text[m[0]:m[1]]
-		interp.currentText = matched
-		interp.splitRecord(matched)
-		interp.execAction(st.Body, scope)
-		if interp.breaking || interp.continuing || interp.returning ||
-			interp.nexting || interp.nextfiling || interp.exiting {
-			break
-		}
-	}
-	interp.restoreState(saved)
+	interp.execStructural(structuralExtract(st.Regex, interp.currentText), st.Body, scope)
 }
 
 func (interp *Interpreter) execYStmt(st *YStmt, scope *Scope) {
+	interp.execStructural(structuralGaps(st.Regex, interp.currentText), st.Body, scope)
+}
+
+// execStructural runs action for each span [start,end) in the current text.
+// break/continue are consumed locally (scoped to the match loop).
+// next/nextfile/exit propagate outward to the record or program level.
+func (interp *Interpreter) execStructural(spans [][]int, action []Stmt, scope *Scope) {
 	text := interp.currentText
-	gaps := structuralGaps(st.Regex, text)
 	saved := interp.savedState()
-	for _, g := range gaps {
-		gap := text[g[0]:g[1]]
-		if gap == "" {
+	for _, sp := range spans {
+		segment := text[sp[0]:sp[1]]
+		if segment == "" {
 			continue
 		}
-		interp.currentText = gap
-		interp.splitRecord(gap)
-		interp.execAction(st.Body, scope)
-		if interp.breaking || interp.continuing || interp.returning ||
-			interp.nexting || interp.nextfiling || interp.exiting {
+		interp.currentText = segment
+		interp.splitRecord(segment)
+		interp.execAction(action, scope)
+		if interp.breaking {
+			interp.breaking = false // consumed: exits match loop, not outer rule
 			break
+		}
+		if interp.continuing {
+			interp.continuing = false // consumed: next match
+			continue
+		}
+		if interp.returning || interp.nexting || interp.nextfiling || interp.exiting {
+			break // propagate upward
 		}
 	}
 	interp.restoreState(saved)
