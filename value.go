@@ -175,17 +175,6 @@ func compare(a, b *Value) int {
 	return 0
 }
 
-// arrayKey returns the string key for array indexing.
-func arrayKey(vals []*Value, subsep string) string {
-	if len(vals) == 1 {
-		return vals[0].toString()
-	}
-	parts := make([]string, len(vals))
-	for i, v := range vals {
-		parts[i] = v.toString()
-	}
-	return strings.Join(parts, subsep)
-}
 
 // clone makes a shallow copy of a value (for passing to functions by value).
 func (v *Value) clone() *Value {

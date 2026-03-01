@@ -1,0 +1,984 @@
+cawk Implementation Plan
+========================
+
+Sources:
+  - Rob Pike, "Structural Regular Expressions" (struct-regex.txt)
+  - Rob Pike, "A tutorial for the sam command language" (sam_tut.txt)
+  - Plan 9 awk man page (standard one-true-awk, no structural extensions)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. WHAT THE SOURCES ACTUALLY SAY
+──────────────────────────────────
+
+1.1 Plan 9 awk
+───────────────
+
+Plan 9 awk is standard one-true-awk. It has field splitting (FS), record
+splitting (RS), NR, NF, $1/$2/..., pattern-action rules where patterns are
+g-expressions (the whole line is passed to the action), next/nextfile, and
+all the standard builtins. Pike never implemented structural regex in awk.
+The Plan 9 awk source is the implementation baseline we're extending FROM.
+
+1.2 The structural regex paper
+───────────────────────────────
+
+The paper describes x/y/g/v as SAM's command language — an interactive
+text editor. These are not proposed AWK keywords.
+
+The "awk of the future" section proposes ONE semantic change to AWK:
+
+  CURRENT AWK:  /re/ { action }
+    g-semantics: fires for each input LINE that contains a match of re.
+    $0 = the entire line. The match is not exposed.
+
+  FUTURE AWK:   /re/ { action }
+    x-semantics: fires for each MATCH of re in the input stream.
+    $0 = exactly the matched text. The stream advances by len($0).
+
+The syntax is IDENTICAL. No new keywords. The paper's examples show this:
+
+  / +/{ x += length($0) }      ← standard AWK syntax
+  /#+/{ print "rect", ...; x += length($0) }
+  /\n/{ x=1; y++ }
+
+Guards inside blocks in the paper are written as standard AWK expressions:
+
+  input ~ /%A.*Bimmler/ {      ← $0 ~ /re/, not g/re/
+      /%P.*([0-9]+)-([0-9]+)/ {
+          pages += $2 - $1 + 1
+      }
+  }
+
+The paper also describes nesting: "structural expressions would be
+applicable to the output of structural expressions; that is, we would
+be able to nest structural expressions inside the actions." This means
+/re/ { action } inside a block operates on the current $0 (from the outer
+x-expression), not on the stream directly.
+
+The y/y/g/v names (from sam) do NOT appear in the "awk of the future"
+section at all. They are sam commands, not proposed AWK syntax.
+
+1.3 What this means for cawk
+──────────────────────────────
+
+cawk is the implementation of Pike's "awk of the future." The design is:
+  - Same AWK syntax as Plan 9 awk.
+  - One semantic change: top-level /re/ patterns are x-expressions.
+  - One syntactic addition: /re/ { } inside blocks is an inner x-expression
+    operating on $0 (iterating over matches of re within the current $0).
+  - Guards use $0 ~ /re/ (existing AWK) not a new keyword.
+  - The x/g/v/y keywords from sam are NOT part of this language.
+  - y/re/ { } is kept as an optional extension (gaps between matches),
+    since there is no AWK idiom for it, but it is not core.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+2. LANGUAGE DESIGN
+──────────────────
+
+2.1 Top-level program structure
+────────────────────────────────
+
+A cawk program is a sequence of rules, just like AWK:
+
+  rule:
+      BEGIN block
+    | END block
+    | /re/ block       ← x-expression: stream scanner
+    | block            ← implicit /[^\n]*\n/ scanner (AWK compat)
+
+  block: { stmts }
+
+The /re/ block form uses x-semantics: the stream is scanned for anchored
+matches of re at the current position. $0 = the matched text. $1/$2/... =
+capture groups. The stream advances by len($0). First matching rule wins.
+
+The bare block form is shorthand for /[^\n]*\n/ with $0 set to the line
+text WITHOUT the trailing newline (for AWK compatibility: { print $0 }
+prints the line cleanly). This is the only case where the newline is
+stripped; an explicit /[^\n]*\n/ { } would include it in $0.
+
+No expression patterns at the top level. Expression conditions go inside
+blocks as if statements.
+
+2.2 x-expression semantics
+────────────────────────────
+
+At the top level, /re/ { action } means:
+  1. Find the next anchored match of re at the current stream position.
+     If no match: this rule does not fire. Try the next rule.
+     If no rule fires at this position: advance one byte (silent skip).
+  2. Set $0 = matched text.
+  3. Set $1, $2, ... = capture groups from re.
+  4. Set $name for any named groups (?P<name>...) in re.
+  5. Advance the stream by len($0). This always happens once x matches
+     (commit semantics: the stream advances regardless of what the action
+     does, including if the action doesn't print anything).
+  6. Run the action block.
+
+Inside a block, /re/ { stmts } means:
+  1. Iterate over ALL non-overlapping matches of re within current $0.
+  2. For each match:
+       Push new match state: inner $0 = match, inner $n = captures.
+       Run stmts.
+       Pop match state (outer $0/$n/$name restored).
+  3. If no matches: the inner block does not run (zero iterations).
+
+This is the "nesting" Pike describes. Top-level /re/ scans the stream;
+nested /re/ scans the current $0.
+
+2.3 Guards: use $0 ~ /re/
+───────────────────────────
+
+There is no g// or v// keyword. Guards are written as standard AWK:
+
+  if ($0 ~ /re/)  { ... }    ← fire if $0 contains match of re
+  if ($0 !~ /re/) { ... }    ← fire if $0 does not contain match
+
+These do NOT change $0, $1, etc. They are pure boolean tests.
+This is standard AWK syntax, unchanged.
+
+2.4 Match state: $0, $n, $name
+────────────────────────────────
+
+$0, $1, $2, ... are no longer FS-split fields. They are match captures:
+
+  $0      = full text extracted by the enclosing /re/ pattern
+  $1, $2  = positional capture groups from the enclosing /re/ pattern
+  $name   = named capture group (?P<name>...) from the enclosing /re/
+
+At the top level before any x-expression fires, $0 is "". The implicit
+bare-block scanner sets $0 to the current line.
+
+Assignment to $0 mutates the current match state (top of match stack).
+This allows { $0 = toupper($0); print } to work as expected.
+
+Match state is a STACK. Each /re/ { } (top-level or nested) pushes a new
+state on entry and pops on exit. After a nested /re/ { } block exits, the
+outer $0/$n/$name is fully restored. This is automatic and transparent.
+
+Named groups ($name syntax): dollar sign followed by an identifier, not
+a digit. $year, $host, $word. These look up the named group from the
+current top of the match stack.
+
+2.5 The y// extension (gaps)
+─────────────────────────────
+
+y/re/ { stmts } iterates over the GAPS between matches of re in $0:
+
+  $0 = "abc123def456"
+  y/[0-9]+/ { print $0 }   →  prints "abc", "def", ""  (text between numbers)
+
+y is kept as a keyword because there is no AWK idiom for gap iteration.
+y only appears as a statement inside blocks; it is not valid at the top
+level as a stream scanner (the gap of a stream is ill-defined).
+y does NOT appear in the "awk of the future" examples. It is a useful
+extension from sam's model, kept because it fills a genuine gap.
+
+2.6 What is removed from standard AWK
+───────────────────────────────────────
+
+REMOVED (replaced by x-expression semantics):
+  - FS field splitting ($1/$2/... are now capture groups, not FS fields)
+  - RS (record separator) — stream is not pre-split
+  - NR, FNR (no record concept)
+  - NF (no field count)
+  - next, nextfile (no record loop to skip)
+
+REMOVED (no structural regex equivalent):
+  - Range patterns (pattern1, pattern2) — stateful, not structural
+
+KEPT UNCHANGED:
+  - BEGIN / END
+  - OFS, ORS, OFMT, SUBSEP, CONVFMT
+  - ENVIRON, ARGC, ARGV, FILENAME
+  - All AWK statements: if/else, for, while, do, break, continue, return,
+    print, printf, delete, exit
+  - All AWK builtins: gsub, sub, match, split, substr, sprintf, length,
+    toupper, tolower, index, sin, cos, sqrt, int, rand, srand, system,
+    getline (from file and pipe only — main stream is owned by scanner)
+  - User-defined functions
+  - Arrays and all array operations
+  - -v flag, -f flag
+  - Output redirection: > >> |
+  - The ~ and !~ operators (used for guards)
+
+NOT KEPT from Plan 9 awk specifically:
+  - -F flag (FS gone)
+  - -safe flag
+  - -mf / -mr flags
+  - nextfile (already removed)
+  - utf() builtin (not needed for cawk's scope)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+3. FILE-BY-FILE CHANGES
+────────────────────────
+
+3.1 token.go
+─────────────
+
+REMOVE as keywords (they become ordinary identifiers):
+  itemX, itemG, itemV  — no longer structural keywords
+
+KEEP as keyword:
+  itemY  — y/re/ { } gap iteration
+
+ADD:
+  itemNamedGroupRef  — $name token (dollar + identifier)
+
+The existing REGEX token (context-sensitive: DIV vs REGEX_START) is
+unchanged. The context-sensitive disambiguation already handles the case
+where / could be division or regex start.
+
+3.2 lexer.go
+─────────────
+
+REMOVE from keyword map:
+  "x" → itemX
+  "g" → itemG
+  "v" → itemV
+
+KEEP in keyword map:
+  "y" → itemY
+
+CHANGE dollar ($) handling:
+  If $ is immediately followed by a letter or underscore:
+    Lex the full identifier, emit itemNamedGroupRef with that name.
+  Otherwise: existing behavior (positional field or computed field).
+
+CHANGE context-sensitive / handling:
+  The lexer already knows when / starts a regex vs. divides. At the top
+  level of a rule (after a newline or semicolon), / starts a regex.
+  Inside expressions, / is division unless after certain tokens.
+  No change needed here — the existing heuristic handles /re/ { } at
+  both the top level (rule context) and inside blocks (stmt context)
+  because the pattern is: after tokens that cannot end an expression,
+  / starts a regex.
+
+3.3 ast.go
+──────────
+
+REMOVE entirely:
+  - Pattern interface and all implementations (BeginPattern, EndPattern,
+    RegexPattern, ExprPattern)
+  - XStmt (replaced by RegexStmt)
+  - GStmt (replaced by if ($0 ~ /re/) — no AST node needed)
+  - VStmt (replaced by if ($0 !~ /re/) — no AST node needed)
+
+KEEP:
+  - YStmt (gap iteration, kept as extension)
+  - All other statement types unchanged
+
+MODIFY Rule:
+
+  type Rule struct {
+      IsBegin bool
+      IsEnd   bool
+      // Regex is the x-expression pattern. Empty = implicit /[^\n]*\n/.
+      // Ignored for IsBegin/IsEnd rules.
+      Regex   string
+      Action  []Stmt
+  }
+
+ADD:
+
+  // RegexStmt is /re/ { stmts } inside a block — inner x-expression.
+  // Iterates over all matches of Regex within current $0.
+  // Pushes/pops match state for each iteration.
+  type RegexStmt struct {
+      Regex  string
+      Action []Stmt
+  }
+  func (*RegexStmt) stmtNode() {}
+
+  // NamedGroupExpr is $name — a named capture group reference.
+  type NamedGroupExpr struct {
+      Name string
+  }
+  func (*NamedGroupExpr) exprNode() {}
+
+3.4 scope.go
+─────────────
+
+ADD: Match state stack
+
+  // MatchState holds $0/$n/$name for one x-expression level.
+  type MatchState struct {
+      Text        string            // $0
+      Groups      []string          // $1, $2, ... (stored 0-indexed)
+      NamedGroups map[string]string // $name
+  }
+
+  // In Interpreter struct:
+  matchStack []MatchState
+
+  func (interp *Interpreter) pushMatch(ms MatchState)
+  func (interp *Interpreter) popMatch()
+  func (interp *Interpreter) currentMatch() MatchState  // top of stack or zero
+
+  // matchStateFromRegex builds a MatchState from a successful regex match.
+  // re is the compiled regex. text is the full string. m is FindStringSubmatchIndex result.
+  func matchStateFromRegex(re *regexp.Regexp, text string, m []int) MatchState {
+      ms := MatchState{
+          Text:        text[m[0]:m[1]],
+          NamedGroups: make(map[string]string),
+      }
+      names := re.SubexpNames()
+      for i := 1; i < len(m)/2; i++ {
+          s, e := m[2*i], m[2*i+1]
+          val := ""
+          if s >= 0 { val = text[s:e] }
+          ms.Groups = append(ms.Groups, val)
+          if names[i] != "" {
+              ms.NamedGroups[names[i]] = val
+          }
+      }
+      return ms
+  }
+
+CHANGE getDollar / setDollar to use match stack:
+
+  getDollar(n int) string:
+      ms := interp.currentMatch()
+      if n == 0: return ms.Text
+      if n >= 1 && n-1 < len(ms.Groups): return ms.Groups[n-1]
+      return ""
+
+  setDollar(n int, val string):
+      if len(interp.matchStack) == 0: return
+      top := &interp.matchStack[len(interp.matchStack)-1]
+      if n == 0: top.Text = val
+      if n >= 1: grow Groups if needed; top.Groups[n-1] = val
+
+REMOVE:
+  - setMatch(), setLine() helpers (replaced by pushMatch/popMatch)
+  - fields []string, currentLine string (subsumed by match stack)
+  - nexting bool (already removed)
+  - currentScanner (already removed)
+  - FS, RS, NR, NF related fields (already removed)
+
+3.5 awk.go.y (grammar)
+───────────────────────
+
+CHANGE rule production:
+
+  OLD:
+    rule: pattern block | BEGIN block | END block
+    pattern: /* empty */ | expr | REGEX
+
+  NEW:
+    rule:
+        REGEX block
+        { $$ = &Rule{Regex: $1, Action: $2} }
+      | block
+        { $$ = &Rule{Action: $1} }
+      | BEGIN block
+        { $$ = &Rule{IsBegin: true, Action: $2} }
+      | END block
+        { $$ = &Rule{IsEnd: true, Action: $2} }
+      ;
+
+REMOVE:
+  - pattern production entirely
+  - X, G, V as structural keywords in grammar (they are now identifiers)
+  - Chain/chain_tail productions
+
+ADD to stmt production:
+
+    stmt:
+        ...existing AWK stmts...
+      | REGEX block
+        { $$ = &RegexStmt{Regex: $1, Action: $2} }
+      | Y REGEX block
+        { $$ = &YStmt{Regex: $2, Action: $3} }
+      ;
+
+  REGEX block inside stmt is an inner x-expression (iterates over matches
+  of REGEX within current $0, with push/pop of match state).
+
+  Disambiguation: after parsing REGEX in statement context, if the next
+  token is '{', the parser shifts (yacc default) to complete REGEX block
+  as a RegexStmt. If not '{', REGEX reduces to a primary expression.
+  This is unambiguous because a primary expression is never directly
+  followed by '{' in any other AWK grammar production.
+
+ADD to primary production:
+
+    primary:
+        ...existing primaries...
+      | NAMED_GROUP_REF
+        { $$ = &NamedGroupExpr{Name: $1} }
+      ;
+
+KEEP UNCHANGED in stmt:
+  All AWK statements. Notably, if/else is unchanged and is used for guards:
+    if ($0 ~ /re/) { ... }    ← guard (replaces g/re/ { })
+    if ($0 !~ /re/) { ... }   ← anti-guard (replaces v/re/ { })
+
+3.6 eval.go
+────────────
+
+REWRITE scanStream:
+
+  func (interp *Interpreter) scanStream(r io.Reader, filename string) {
+      // Setup: bufio.Reader, byte buffer, pos=0, eof=false.
+
+      rules := interp.mainRules()  // non-BEGIN, non-END
+
+      // Lookahead: max literal \n count in any rule's Regex, + 1.
+      lookahead := 1
+      for _, rule := range rules {
+          if n := strings.Count(rule.Regex, `\n`) + 1; n > lookahead {
+              lookahead = n
+          }
+      }
+
+      for {
+          ensureLines(lookahead)
+          if pos >= len(buf) { break }
+
+          fired := false
+          for _, rule := range rules {
+              if adv, ok := interp.tryRule(rule, buf, pos); ok {
+                  pos += adv
+                  fired = true
+                  break
+              }
+          }
+          if !fired { pos++ }  // silent advance: Pike's model
+
+          if interp.exiting { break }
+      }
+  }
+
+REWRITE tryRule:
+
+  func (interp *Interpreter) tryRule(rule *Rule, buf []byte, pos int) (int, bool) {
+      if rule.IsBegin || rule.IsEnd { return 0, false }
+
+      // Implicit /[^\n]*\n/ scanner (bare block rule).
+      if rule.Regex == "" {
+          slice := buf[pos:]
+          nl := bytes.IndexByte(slice, '\n')
+          if nl < 0 {
+              if !eof || len(slice) == 0 { return 0, false }
+              interp.pushMatch(MatchState{Text: string(slice)})
+              interp.execStmts(rule.Action, interp.global)
+              interp.popMatch()
+              return len(slice), true
+          }
+          // Strip the newline: $0 = line without \n (AWK compat).
+          interp.pushMatch(MatchState{Text: string(slice[:nl])})
+          interp.execStmts(rule.Action, interp.global)
+          interp.popMatch()
+          return nl + 1, true
+      }
+
+      // Explicit /Regex/ rule: anchored x-expression.
+      re := compileDotAll(rule.Regex)
+      slice := string(buf[pos:])
+      m := re.FindStringSubmatchIndex(slice)
+      if m == nil || m[0] != 0 { return 0, false }
+
+      ms := matchStateFromRegex(re, slice, m)
+      interp.pushMatch(ms)
+      interp.execStmts(rule.Action, interp.global)
+      interp.popMatch()
+      return m[1], true  // commit: always advance by match length
+  }
+
+ADD RegexStmt execution (execRegexStmt):
+
+  // RegexStmt = /re/ { stmts } inside a block.
+  // Iterates over all matches of re within current $0.
+  func (interp *Interpreter) execRegexStmt(st *RegexStmt, scope *Scope) {
+      re := compileDotAll(st.Regex)
+      text := interp.currentMatch().Text
+      all := re.FindAllStringSubmatchIndex(text, -1)
+      for _, m := range all {
+          ms := matchStateFromRegex(re, text, m)
+          interp.pushMatch(ms)
+          interp.execStmts(st.Action, scope)
+          interp.popMatch()
+          if interp.exiting || interp.breaking || interp.continuing { break }
+      }
+  }
+
+CHANGE YStmt execution to use push/popMatch:
+
+  func (interp *Interpreter) execYStmt(st *YStmt, scope *Scope) {
+      re := compileDotAll(st.Regex)
+      text := interp.currentMatch().Text
+      for _, gap := range structuralGaps(text, re) {
+          interp.pushMatch(MatchState{Text: gap})
+          interp.execStmts(st.Action, scope)
+          interp.popMatch()
+          if interp.exiting || interp.breaking || interp.continuing { break }
+      }
+  }
+
+REMOVE execXStmt, execGStmt, execVStmt (replaced by execRegexStmt and IfStmt).
+
+CHANGE evalExpr for field access:
+
+  FieldExpr ($n):
+      n := evaluate n as int
+      if n == 0: return strVal(interp.currentMatch().Text)
+      ms := interp.currentMatch()
+      if n >= 1 && n-1 < len(ms.Groups): return strVal(ms.Groups[n-1])
+      return strVal("")
+
+  NamedGroupExpr ($name):
+      ms := interp.currentMatch()
+      return strVal(ms.NamedGroups[name])  // "" if not found
+
+CHANGE sub/gsub when target is $0:
+  Mutate interp.matchStack top's Text field (not a separate field variable).
+
+3.7 builtin.go
+───────────────
+
+CHANGE sub/gsub: when the target expression is a FieldExpr($0), update
+the match stack top's Text instead of a separate field. The result is that
+gsub($0 → ...) then print $0 prints the modified text.
+
+No other builtin changes needed. split() uses an explicit separator (not
+FS) and is already correct.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+4. IMPLEMENTATION ORDER
+────────────────────────
+
+Step 1 — token.go
+  Remove "x", "g", "v" from keyword map. Keep "y".
+  Add itemNamedGroupRef.
+  Build passes (keywords removed, new token unused).
+
+Step 2 — lexer.go
+  Remove itemX, itemG, itemV from newline-injection switch.
+  Add $name → itemNamedGroupRef handling.
+  Build passes.
+
+Step 3 — ast.go
+  Remove Pattern interface and implementations.
+  Remove XStmt, GStmt, VStmt.
+  Modify Rule: IsBegin/IsEnd/Regex/Action.
+  Add RegexStmt, NamedGroupExpr.
+  Build fails (grammar and eval reference old types).
+
+Step 4 — awk.go.y
+  Change rule production to REGEX block | block | BEGIN block | END block.
+  Remove pattern production and X/G/V structural keyword uses.
+  Add REGEX block to stmt production (RegexStmt).
+  Add NAMED_GROUP_REF to primary.
+  Keep Y REGEX block in stmt (YStmt).
+  Run: go generate
+  Build may fail (eval references old types).
+
+Step 5 — scope.go
+  Add MatchState, matchStack, pushMatch, popMatch, currentMatch.
+  Add matchStateFromRegex.
+  Change getDollar/setDollar to use match stack.
+  Remove old helpers (setMatch, setLine, fields, currentLine).
+  Build fails until eval is updated.
+
+Step 6 — eval.go
+  Rewrite scanStream and tryRule.
+  Add execRegexStmt.
+  Change execYStmt to use push/popMatch.
+  Remove execXStmt, execGStmt, execVStmt.
+  Change evalExpr for FieldExpr and add NamedGroupExpr case.
+  Change $0 assignment to mutate match stack top.
+  go build passes.
+
+Step 7 — builtin.go
+  Fix sub/gsub to mutate match stack top when target is $0.
+  go build passes.
+
+Step 8 — awk_test.go
+  Rewrite all tests (see Section 5).
+  go test passes.
+
+Step 9 — Commit
+  go generate && go build -o cawk .
+  Commit generated awk.go.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+5. TEST PLAN
+─────────────
+
+5.1 Stream scanner: /re/ is x-expression
+──────────────────────────────────────────
+
+TestXSemantics:
+  prog: /[a-z]+/ { print $0 }
+  input: "hello world\n"
+  want: "hello\nworld\n"
+  (x-semantics: each word match is a separate $0; not AWK's "print the line")
+
+TestXAdvancesStream:
+  prog: /[0-9]+/ { print $0 }
+  input: "abc 123 def 456\n"
+  want: "123\n456\n"
+  (letters and spaces silently advance one byte at a time)
+
+TestXMultiLine:
+  prog: /foo\nbar\n/ { print "match" }  { print $0 }
+  input: "foo\nbar\nbaz\n"
+  want: "match\nbaz\n"
+  (two-line pattern matches atomically; baz goes to bare block)
+
+TestFirstRuleWins:
+  prog: /[0-9]+/ { print "num:", $0 }  /[a-z]+/ { print "word:", $0 }
+  input: "abc123\n"
+  want: "word: abc\nnum: 123\n"
+  (abc matched by word rule; 123 matched by num rule; \n silently advanced)
+
+TestImplicitScanner:
+  prog: { print "line:", $0 }
+  input: "a\nb\nc\n"
+  want: "line: a\nline: b\nline: c\n"
+  ($0 does not include the trailing \n)
+
+TestImplicitVsExplicit:
+  Implicit { print $0 } gives $0 = "hello" (no newline).
+  Explicit /[^\n]*\n/ { print $0 } gives $0 = "hello\n" (with newline).
+  This is the documented difference.
+
+5.2 Capture groups
+───────────────────
+
+TestPositionalGroups:
+  prog: /([0-9]{4})-([0-9]{2})-([0-9]{2})/ { print $1, $2, $3 }
+  input: "2024-01-15\n"
+  want: "2024 01 15\n"
+
+TestNamedGroups:
+  prog: /(?P<y>\d{4})-(?P<m>\d{2})-(?P<d>\d{2})/ { print $d"/"$m"/"$y }
+  input: "2024-01-15\n"
+  want: "15/01/2024\n"
+
+TestNamedAndPositional:
+  prog: /(?P<word>[a-z]+)/ { print $1, $word }
+  input: "hello\n"
+  want: "hello hello\n"   ($1 and $word are the same group)
+
+TestNoCaptures:
+  prog: /[a-z]+/ { print $0, $1 }
+  input: "hi\n"
+  want: "hi \n"   ($1 is "" when there are no capture groups)
+
+5.3 Guards: if ($0 ~ /re/)
+────────────────────────────
+
+TestGuard:
+  prog: { if ($0 ~ /error/) { print "ERR:", $0 } }
+  input: "ok\nerror here\nfine\n"
+  want: "ERR: error here\n"
+
+TestAntiGuard:
+  prog: { if ($0 !~ /error/) { print $0 } }
+  input: "ok\nerror\nfine\n"
+  want: "ok\nfine\n"
+
+TestGuardWithX:
+  prog: /[^\n]*\n/ { if ($0 ~ /foo/) { print "has foo:", $0 } }
+  Same as above but using explicit x-expression scanner.
+
+5.4 Nested /re/ { } inside blocks
+────────────────────────────────────
+
+TestNestedX:
+  prog: /[^\n]*\n/ { /[a-z]+/ { print $0 } }
+  input: "hello world\n"
+  Outer: $0 = "hello world\n". Inner iterates over words.
+  want: "hello\nworld\n"
+
+TestNestedXCaptures:
+  prog: { /([a-z]+)=([0-9]+)/ { print $1, "→", $2 } }
+  input: "x=1 y=2 z=3\n"
+  want: "x → 1\ny → 2\nz → 3\n"
+
+TestBimmler:
+  prog:
+    /(.+\n)+/ {
+        if ($0 ~ /%A.*Bimmler/) {
+            /.*\n/ {
+                if ($0 ~ /^%T/) { print $0 }
+            }
+        }
+    }
+  input: (refer database with Bimmler entries)
+  Outer /(.+\n)+/ extracts paragraphs.
+  Guard tests for Bimmler authorship.
+  Inner /.*\n/ iterates over lines; guard tests for title line.
+
+TestCapitalizeI:
+  prog: /[A-Za-z]+/ { if ($0 ~ /^i$/) { print "I" } else { print $0 } }
+  input: "this is it\n"
+  Extracts each word. Prints "I" for standalone "i", else the word.
+  want: "this\nI\nI\nt\n"
+  (each character of "it" is a separate letter... wait, /[A-Za-z]+/ matches
+  whole words. "it" → $0 = "it", $0 ~ /^i$/ fails → print "it")
+  want: "this\nI\nit\n"
+
+5.5 Match state save/restore
+──────────────────────────────
+
+TestMatchStateRestore:
+  prog: /([^\n]+)\n/ {
+      /([a-z]+)/ { }   ← inner loop modifies $0/$1
+      print $1          ← should be outer $1 (full line text)
+  }
+  input: "hello world\n"
+  After inner loop: outer $1 = "hello world" is restored.
+  want: "hello world\n"
+
+TestNestedDollarZero:
+  prog: /([^\n]+)\n/ {
+      /[a-z]+/ { print "inner:", $0 }
+      print "outer:", $0
+  }
+  input: "hello world\n"
+  want: "inner: hello\ninner: world\nouter: hello world\n"
+
+TestDollarZeroAssign:
+  prog: { $0 = toupper($0); print }
+  input: "hello\n"
+  want: "HELLO\n"
+
+5.6 Y extension (gap iteration)
+─────────────────────────────────
+
+TestY:
+  prog: { y/[0-9]+/ { print $0 } }
+  input: "abc123def456\n"
+  Gaps between numbers: "abc", "def", "".
+  want: "abc\ndef\n\n"
+
+TestYVsX:
+  prog: { y/,/ { print $0 } }
+  input: "a,b,c\n"
+  Gaps between commas: "a", "b", "c\n"
+  want: "a\nb\nc\n"
+
+5.7 AWK compatibility
+───────────────────────
+
+TestBeginEnd:
+  prog: BEGIN{print "start"} { } END{print "end"}
+  input: "x\ny\n"
+  want: "start\nend\n"
+
+TestCountLines:
+  prog: BEGIN{n=0} {n++} END{print n}
+  input: "a\nb\nc\n"
+  want: "3\n"
+
+TestArrays:
+  prog: /[a-z]+/ { count[$0]++ }
+       END { print count["hello"], count["world"] }
+  input: "hello world hello\n"
+  want: "2 1\n"
+
+TestUserFunction:
+  prog: function double(x){return x*2}  /[0-9]+/{print double($0)}
+  input: "3\n7\n"
+  want: "6\n14\n"
+
+TestGsub:
+  prog: { gsub(/o/, "0"); print $0 }
+  input: "foo bar\n"
+  want: "f00 bar\n"
+
+TestSplit:
+  prog: BEGIN { n=split("a:b:c",a,":"); for(i=1;i<=n;i++) print a[i] }
+  want: "a\nb\nc\n"
+
+TestGetlineFile:
+  Write "secret\n" to temp file.
+  prog: BEGIN { getline line < "/tmp/f"; print line }
+  want: "secret\n"
+
+TestExit:
+  prog: /stop\n/ { exit }  { print $0 }
+  input: "a\nb\nstop\nc\n"
+  want: "a\nb\n"
+
+TestExitRunsEnd:
+  prog: /stop\n/ { exit }  END { print "done" }
+  input: "a\nstop\n"
+  want: "done\n"
+
+TestOutputRedirect:
+  prog: { print $0 > "/tmp/out" }
+  input: "hello\nworld\n"
+  /tmp/out should contain "hello\nworld\n".
+
+TestVFlag:
+  prog: BEGIN{print x}  with -v x=42
+  want: "42\n"
+
+5.8 The Peter-on-Silicon problem (from Pike's paper)
+─────────────────────────────────────────────────────
+
+TestRectsSparse:
+  prog:
+    / +/ { x += length($0) }
+    /#+/ { print "rect", x, x+length($0), y, y+1; x += length($0) }
+    /\n/ { x=1; y++ }
+  BEGIN { x=1; y=1 }
+  input: (the Peter ascii art grid)
+  want: (the rect statements encoding non-blank character positions)
+
+This test directly validates Pike's "awk of the future" first example
+using the exact syntax and semantics he describes.
+
+5.9 Edge cases
+───────────────
+
+TestEmptyInput:
+  prog: BEGIN{print "hi"} {print $0} END{print "bye"}
+  input: ""
+  want: "hi\nbye\n"
+
+TestEOFNoNewline:
+  prog: { print $0 }
+  input: "hello"  (no trailing newline)
+  want: "hello\n"
+
+TestSparseAdvance:
+  prog: /[A-Z]+/ { print $0 }
+  input: "Hello WORLD\n"
+  Uppercase runs: "H" (from Hello), "WORLD".
+  want: "H\nWORLD\n"
+
+TestNestedCaptureGroups:
+  prog: /(?P<outer>[a-z]+)/ {
+      /(?P<inner>[aeiou])/ { print $outer, $inner }
+  }
+  input: "hello\n"
+  For each vowel in "hello": outer $0 is the word, inner $0 is the vowel.
+  But wait: outer x extracts the whole word "hello" then scans it for vowels.
+  Inner $outer = ? — $outer was set by outer x; is it visible inside?
+  Answer: YES. Named groups persist on the stack. The inner x pushes a
+  new MatchState for each vowel; $inner is set. But $outer is from the
+  OUTER match state (below the inner one on the stack). We need to define
+  whether $outer in the inner block reads from the inner or outer state.
+  Decision: $name reads from the TOP of the match stack only. To access
+  the outer match inside an inner block, save it to a variable:
+    /(?P<word>[a-z]+)/ { w=$word; /([aeiou])/ { print w, $1 } }
+  This is clean and avoids complex multi-level stack lookups.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+6. OPEN QUESTIONS
+──────────────────
+
+6.1 y at the top level
+
+y/re/ { } at the top level would mean "fire for gaps between re-matches
+in the stream." This is unusual and complex (requires knowing where re
+matches to find the gaps). Defer: emit a parse error if y appears at the
+top level of a rule. Only allow y inside blocks.
+
+6.2 Expression patterns at the top level
+
+Standard AWK allows: NR==2 { print } as an expression pattern.
+In cawk, this is removed — there is no implicit record number.
+The equivalent: { if (NR==2) { print $0 } } where NR is a user variable
+incremented manually: { NR++; if (NR==2) print $0 }.
+Or, just put the condition inside the block.
+
+6.3 Named group scoping across nested /re/ {}
+
+As documented in TestNestedCaptureGroups: $name reads from the top of
+the match stack only. Named groups from outer x-expressions are shadowed
+inside inner blocks. Users should save outer named group values to
+ordinary variables if needed inside inner blocks.
+
+6.4 sub/gsub and $0
+
+sub(re, repl) and gsub(re, repl) with no third argument operate on $0.
+In cawk, $0 is the top of the match stack. Mutation of $0 via sub/gsub
+updates the match stack top's Text field. The stream is not modified (cawk
+is a filter, not an editor). The updated $0 is visible to subsequent code
+in the same action block.
+
+6.5 print with no arguments
+
+In AWK, print with no arguments prints $0. In cawk, this prints the
+current match state's Text (top of match stack). This is correct and
+natural.
+
+6.6 getline from main stream
+
+getline (plain, from main stream) is not supported. The main stream is
+owned by the scanner. Only getline var < file and cmd | getline var are
+supported. If a user writes plain getline, emit a runtime error.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+7. EXAMPLES
+────────────
+
+# Count words (x-expression)
+/[a-zA-Z]+/ { words++ }
+END { print words }
+
+# Print lines containing "error"
+{ if ($0 ~ /error/) { print $0 } }
+
+# Date parsing with named groups
+/(?P<y>\d{4})-(?P<m>\d{2})-(?P<d>\d{2})/ {
+    printf "%s/%s/%s\n", $d, $m, $y
+}
+
+# Hotkey daemon (multi-line x-expression)
+/ctrl alt del\n/ { system("lock-screen") }
+/ctrl c\n/       { exit }
+{ }                    # consume and ignore remaining input lines
+
+# Bimmler paper search (from Pike's paper, exact syntax)
+/(.+\n)+/ {
+    if ($0 ~ /%A.*Bimmler/) {
+        /.*\n/ {
+            if ($0 ~ /^%T/) { print $0 }
+        }
+    }
+}
+
+# Peter-on-silicon rect extraction (from Pike's paper, exact syntax)
+BEGIN { x=1; y=1 }
+/ +/ { x += length($0) }
+/#+/ { print "rect", x, x+length($0), y, y+1; x += length($0) }
+/\n/ { x=1; y++ }
+
+# Word frequency
+/[a-zA-Z]+/ { freq[$0]++ }
+END { for (w in freq) print freq[w], w }
+
+# Rename standalone variable n to num (protecting \n escape sequences)
+# Each line: extract identifiers; check for standalone n.
+{
+    /[a-zA-Z_][a-zA-Z_0-9]*/ {
+        if ($0 == "n") { printf "num" } else { printf "%s", $0 }
+    }
+    # Note: this doesn't reconstruct the full line with non-identifier
+    # characters. A complete solution would use y// to interleave gaps.
+    # With y:
+    # y/[a-zA-Z_][a-zA-Z_0-9]*/ { printf "%s", $0 }  ← print gaps
+    # /[a-zA-Z_][a-zA-Z_0-9]*/ {                       ← print identifiers
+    #     if ($0 == "n") { printf "num" } else { printf "%s", $0 }
+    # }
+    # But interleaving two passes over the same $0 requires ordering.
+    # This is where sam's composition model is more elegant than cawk's.
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+END OF PLAN

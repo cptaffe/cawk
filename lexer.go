@@ -147,9 +147,10 @@ func (l *lexer) peekNonSpace() rune {
 func (l *lexer) shouldInsertNewline() bool {
 	switch l.lastType {
 	case itemIdent, itemNumber, itemString, itemRegex,
+		itemNamedGroupRef,
 		itemIncr, itemDecr,
 		itemRParen, itemRBracket, itemRBrace,
-		itemNext, itemNextfile, itemExit,
+		itemExit,
 		itemBreak, itemContinue, itemReturn,
 		itemGetline:
 		return true
@@ -396,6 +397,23 @@ func lexStart(l *lexer) stateFn {
 		return lexStart
 
 	case r == '$':
+		// $name → itemNamedGroupRef (named capture group reference).
+		// $digit or $expr → itemDollar (positional field).
+		if p := l.peek(); isAlpha(p) {
+			l.next() // consume first letter
+			for {
+				r2 := l.peek()
+				if isAlpha(r2) || isDigit(r2) {
+					l.next()
+				} else {
+					break
+				}
+			}
+			// val = name without the leading '$'
+			name := l.input[l.start+1 : l.pos]
+			l.emitVal(itemNamedGroupRef, name)
+			return lexStart
+		}
 		l.emitVal(itemDollar, "$")
 		return lexStart
 

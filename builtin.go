@@ -105,7 +105,7 @@ func (interp *Interpreter) callBuiltin(name string, args []Expr, scope *Scope) *
 		// Clear the array
 		arr.arr = make(map[string]*Value)
 
-		fs := interp.FS
+		fs := " " // default: whitespace (no FS variable in stream mode)
 		if len(args) >= 3 {
 			fs = interp.patternArg(args, 2, scope)
 		}

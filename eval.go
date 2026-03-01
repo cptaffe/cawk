@@ -2,31 +2,24 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"math"
 	"math/rand"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 )
 
-// --- Control flow signals ---
-
-type breakSignal struct{}
-type continueSignal struct{}
-type nextSignal struct{}
-type nextfileSignal struct{}
-type returnSignal struct{ val *Value }
-
+// exitSignal is panicked to implement exit.
 type exitSignal struct{ code int }
 
-// --- Evaluator entry points ---
+// --- Entry point ---
 
-// Run executes the program on the given inputs.
 func (interp *Interpreter) Run(files []string) error {
-	// runPhase runs a function, catching exitSignal to allow END rules to run.
 	runPhase := func(fn func()) (exited bool) {
 		defer func() {
 			if r := recover(); r != nil {
@@ -42,44 +35,48 @@ func (interp *Interpreter) Run(files []string) error {
 		return false
 	}
 
-	// BEGIN rules
+	// BEGIN
 	exited := runPhase(func() {
 		for _, rule := range interp.prog.Rules {
-			if _, ok := rule.Pattern.(*BeginPattern); ok {
+			if rule.IsBegin {
 				interp.execAction(rule.Action, interp.global)
+				if interp.exiting {
+					return
+				}
 			}
 		}
 	})
 
-	// Input processing (skip if exit was called in BEGIN)
+	// Stream scanning
 	if !exited {
 		exited = runPhase(func() {
 			if len(files) == 0 {
-				interp.processReader(os.Stdin, "-")
+				interp.scanStream(os.Stdin, "-")
 			} else {
 				for _, f := range files {
 					if f == "-" {
-						interp.processReader(os.Stdin, "-")
+						interp.scanStream(os.Stdin, "-")
 					} else {
 						fh, err := os.Open(f)
 						if err != nil {
 							fmt.Fprintf(os.Stderr, "cawk: %v\n", err)
-							interp.ERRNO = float64(1)
 							continue
 						}
-						interp.processReader(fh, f)
+						interp.scanStream(fh, f)
 						fh.Close()
+					}
+					if interp.exiting {
+						return
 					}
 				}
 			}
 		})
 	}
 
-	// END rules always run (even after exit), but exit in END exits immediately
 	_ = exited
 	runPhase(func() {
 		for _, rule := range interp.prog.Rules {
-			if _, ok := rule.Pattern.(*EndPattern); ok {
+			if rule.IsEnd {
 				interp.execAction(rule.Action, interp.global)
 			}
 		}
@@ -89,226 +86,163 @@ func (interp *Interpreter) Run(files []string) error {
 	return nil
 }
 
-func (interp *Interpreter) processReader(r io.Reader, filename string) {
+// mainRules returns all rules except BEGIN and END.
+func (interp *Interpreter) mainRules() []*Rule {
+	var out []*Rule
+	for _, r := range interp.prog.Rules {
+		if !r.IsBegin && !r.IsEnd {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// scanStream runs the greedy stream scanner over r.
+//
+// At each stream position, rules are tried in order. The first matching
+// rule fires: $0 = the match, stream advances by len($0). If no rule
+// matches, advance one byte (silent skip — Pike's sparse coverage model).
+//
+// Before trying rules, the buffer is pre-filled with enough complete lines
+// to satisfy the deepest multi-line regex in the program. This ensures a
+// multi-line /foo\nbar\n/ always sees both lines before a catch-all bare
+// block gets a chance to consume "foo".
+func (interp *Interpreter) scanStream(r io.Reader, filename string) {
 	interp.FILENAME = filename
-	interp.FNR = 0
-
-	// Use a bufio.Reader for record-by-record reading to support plain getline
 	br := bufio.NewReader(r)
-	interp.currentScanner = br
 
-	rs := interp.RS
-	if rs == "" || len(rs) > 1 {
-		// Paragraph mode or multi-char/regex RS: need full content
-		content, err := io.ReadAll(br)
+	var buf []byte
+	pos := 0
+	eof := false
+
+	readLine := func() bool {
+		if eof {
+			return false
+		}
+		line, err := br.ReadBytes('\n')
+		if len(line) > 0 {
+			buf = append(buf, line...)
+		}
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "cawk: read error: %v\n", err)
-			interp.currentScanner = nil
+			eof = true
+		}
+		return len(line) > 0
+	}
+
+	rules := interp.mainRules()
+
+	// Compute the maximum number of complete lines any regex pattern needs.
+	lookahead := 1
+	for _, rule := range rules {
+		if n := strings.Count(rule.Regex, `\n`) + 1; n > lookahead {
+			lookahead = n
+		}
+	}
+
+	ensureLines := func(n int) {
+		for !eof {
+			if bytes.Count(buf[pos:], []byte{'\n'}) >= n {
+				break
+			}
+			if !readLine() {
+				break
+			}
+		}
+	}
+
+	for {
+		ensureLines(lookahead)
+		if pos >= len(buf) {
+			break
+		}
+
+		fired := false
+		for _, rule := range rules {
+			adv, ok := interp.tryRule(rule, buf, pos, eof)
+			if ok {
+				pos += adv
+				fired = true
+				break
+			}
+		}
+
+		if !fired {
+			// No rule matched: advance one byte (silent sparse advance).
+			pos++
+		}
+
+		if interp.exiting {
 			return
 		}
-		interp.processInput(string(content))
-	} else {
-		// Record-by-record mode (single char RS, including "\n")
-		for {
-			line, err := interp.readRecordLine()
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "cawk: read error: %v\n", err)
-				break
-			}
-			interp.processRecord(line)
-			if interp.nextfiling {
-				interp.nextfiling = false
-				break
-			}
-		}
-	}
-	interp.currentScanner = nil
-}
-
-// readRecordLine reads one record from currentScanner using RS.
-func (interp *Interpreter) readRecordLine() (string, error) {
-	rs := interp.RS
-	if rs == "\n" || rs == "" {
-		return readLine(interp.currentScanner)
-	}
-	// Single char RS
-	sep := rs[0]
-	var buf []byte
-	b := make([]byte, 1)
-	for {
-		n, err := interp.currentScanner.Read(b)
-		if n > 0 {
-			if b[0] == sep {
-				return string(buf), nil
-			}
-			buf = append(buf, b[0])
-		}
-		if err != nil {
-			if len(buf) > 0 {
-				return string(buf), nil
-			}
-			return "", err
-		}
 	}
 }
 
-func (interp *Interpreter) processInput(text string) {
-	rs := interp.RS
-	if rs == "" {
-		// Paragraph mode: split on blank lines
-		interp.processParagraphMode(text)
-		return
-	}
+// tryRule attempts to match rule at buf[pos:].
+// Returns (advance, true) on success (action has been executed).
+// Returns (0, false) if the rule does not match.
+func (interp *Interpreter) tryRule(rule *Rule, buf []byte, pos int, eof bool) (int, bool) {
+	slice := buf[pos:]
 
-	// Split by RS
-	var records []string
-	if len(rs) == 1 {
-		records = strings.Split(text, rs)
-	} else {
-		// RS is a regex
-		re := mustCompile(rs)
-		records = re.Split(text, -1)
-	}
-
-	// Remove the one trailing empty record caused by a trailing RS/newline.
-	// AWK treats "line\n" as one record, not two.
-	if len(records) > 0 && records[len(records)-1] == "" {
-		records = records[:len(records)-1]
-	}
-
-	for _, record := range records {
-		interp.processRecord(record)
-		if interp.nextfiling {
-			interp.nextfiling = false
-			break
-		}
-	}
-}
-
-func (interp *Interpreter) processParagraphMode(text string) {
-	// Split on one or more blank lines
-	re := mustCompile(`\n\n+`)
-	records := re.Split(strings.TrimLeft(text, "\n"), -1)
-	for _, record := range records {
-		if record == "" {
-			continue
-		}
-		interp.processRecord(record)
-		if interp.nextfiling {
-			interp.nextfiling = false
-			break
-		}
-	}
-}
-
-func (interp *Interpreter) processRecord(record string) {
-	interp.NR++
-	interp.FNR++
-	interp.currentText = record
-	interp.splitRecord(record)
-	interp.nexting = false
-
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				switch r.(type) {
-				case nextSignal:
-					// continue to next record
-				default:
-					panic(r)
-				}
+	if rule.Regex == "" {
+		// Implicit bare-block rule: /[^\n]*\n/ semantics.
+		// $0 = line WITHOUT trailing newline (AWK compat: { print $0 } prints cleanly).
+		nl := bytes.IndexByte(slice, '\n')
+		if nl < 0 {
+			// No newline found.
+			if !eof || len(slice) == 0 {
+				// Not at EOF, or nothing to consume.
+				return 0, false
 			}
-		}()
-		interp.applyRules(record)
-	}()
-	// Reset nexting flag after applyRules completes
-	interp.nexting = false
-}
-
-func (interp *Interpreter) applyRules(record string) {
-	for _, rule := range interp.prog.Rules {
-		// Check next/nextfile/exit signals
-		if interp.nexting || interp.nextfiling || interp.exiting {
-			break
-		}
-		if rule.Pattern == nil {
-			// No pattern: match every record
+			// EOF with no trailing newline: treat remaining bytes as last line.
+			interp.pushMatch(MatchState{Text: string(slice)})
 			interp.execAction(rule.Action, interp.global)
-			continue
+			interp.popMatch()
+			return len(slice), true
 		}
-		switch p := rule.Pattern.(type) {
-		case *BeginPattern, *EndPattern:
-			// handled separately
-		case *ExprPattern:
-			v := interp.evalExpr(p.Expr, interp.global)
-			if v.toBool() {
-				interp.execAction(rule.Action, interp.global)
-			}
-		case *RangePattern:
-			interp.applyRangePattern(p, rule.Action)
-		case *RegexPattern:
-			// Plain regex filter: run action if $0 matches the pattern
-			if matchRegex(p.Regex, record) {
-				interp.execAction(rule.Action, interp.global)
-			}
-		case *XPattern:
-			interp.structuralX(p.Regex, rule.Action)
-		case *YPattern:
-			interp.structuralY(p.Regex, rule.Action)
-		case *GPattern:
-			if matchRegex(p.Regex, interp.currentText) {
-				interp.execAction(rule.Action, interp.global)
-			}
-		case *VPattern:
-			if !matchRegex(p.Regex, interp.currentText) {
-				interp.execAction(rule.Action, interp.global)
-			}
-		}
+		// Strip the newline: $0 = line (no \n), advance past the \n.
+		interp.pushMatch(MatchState{Text: string(slice[:nl])})
+		interp.execAction(rule.Action, interp.global)
+		interp.popMatch()
+		return nl + 1, true
 	}
-}
 
-// Range pattern state
-var rangeActive = make(map[*RangePattern]bool)
-
-func (interp *Interpreter) applyRangePattern(p *RangePattern, action []Stmt) {
-	active := rangeActive[p]
-	if !active {
-		// Check if start matches
-		v := interp.evalExpr(p.From, interp.global)
-		if v.toBool() {
-			rangeActive[p] = true
-			active = true
-		}
+	// Explicit /Regex/ rule: anchored x-expression.
+	// Compile with (?s) so . matches \n (dot-all mode).
+	re := compileDotAll(rule.Regex)
+	m := re.FindSubmatchIndex(slice)
+	if m == nil || m[0] != 0 {
+		return 0, false
 	}
-	if active {
-		interp.execAction(action, interp.global)
-		// Check if end matches
-		v := interp.evalExpr(p.To, interp.global)
-		if v.toBool() {
-			rangeActive[p] = false
-		}
+
+	// Build match state from capture groups.
+	ms := matchStateFromRegex(re, string(slice), m)
+	interp.pushMatch(ms)
+	interp.execAction(rule.Action, interp.global)
+	interp.popMatch()
+	// Commit: advance by match length regardless of action.
+	// Zero-length match advances by 1 to avoid infinite loop.
+	adv := m[1]
+	if adv == 0 {
+		adv = 1
 	}
+	return adv, true
 }
 
-// structuralX: for each match of regex in currentText, run action with $0=match
-func (interp *Interpreter) structuralX(regex string, action []Stmt) {
-	interp.execStructural(structuralExtract(regex, interp.currentText), action, interp.global)
+// compileDotAll compiles a regex with (?s) so . matches \n.
+func compileDotAll(pattern string) *regexp.Regexp {
+	re, err := regexp.Compile("(?s)" + pattern)
+	if err != nil {
+		panic(runtimeError(fmt.Sprintf("bad regex %q: %v", pattern, err)))
+	}
+	return re
 }
 
-// structuralY: for each gap between matches in currentText, run action
-func (interp *Interpreter) structuralY(regex string, action []Stmt) {
-	interp.execStructural(structuralGaps(regex, interp.currentText), action, interp.global)
-}
+// --- Action and statement execution ---
 
-// execAction runs a list of statements.
 func (interp *Interpreter) execAction(stmts []Stmt, scope *Scope) {
 	for _, s := range stmts {
 		interp.execStmt(s, scope)
-		if interp.breaking || interp.continuing || interp.returning ||
-			interp.nexting || interp.nextfiling || interp.exiting {
+		if interp.breaking || interp.continuing || interp.returning || interp.exiting {
 			return
 		}
 	}
@@ -335,8 +269,7 @@ func (interp *Interpreter) execStmt(s Stmt, scope *Scope) {
 
 	case *WhileStmt:
 		for {
-			cond := interp.evalExpr(st.Cond, scope)
-			if !cond.toBool() {
+			if !interp.evalExpr(st.Cond, scope).toBool() {
 				break
 			}
 			interp.execAction(st.Body, scope)
@@ -348,7 +281,7 @@ func (interp *Interpreter) execStmt(s Stmt, scope *Scope) {
 				interp.continuing = false
 				continue
 			}
-			if interp.returning || interp.nexting || interp.nextfiling || interp.exiting {
+			if interp.returning || interp.exiting {
 				return
 			}
 		}
@@ -363,11 +296,10 @@ func (interp *Interpreter) execStmt(s Stmt, scope *Scope) {
 			if interp.continuing {
 				interp.continuing = false
 			}
-			if interp.returning || interp.nexting || interp.nextfiling || interp.exiting {
+			if interp.returning || interp.exiting {
 				return
 			}
-			cond := interp.evalExpr(st.Cond, scope)
-			if !cond.toBool() {
+			if !interp.evalExpr(st.Cond, scope).toBool() {
 				break
 			}
 		}
@@ -377,11 +309,8 @@ func (interp *Interpreter) execStmt(s Stmt, scope *Scope) {
 			interp.execStmt(st.Init, scope)
 		}
 		for {
-			if st.Cond != nil {
-				cond := interp.evalExpr(st.Cond, scope)
-				if !cond.toBool() {
-					break
-				}
+			if st.Cond != nil && !interp.evalExpr(st.Cond, scope).toBool() {
+				break
 			}
 			interp.execAction(st.Body, scope)
 			if interp.breaking {
@@ -391,7 +320,7 @@ func (interp *Interpreter) execStmt(s Stmt, scope *Scope) {
 			if interp.continuing {
 				interp.continuing = false
 			}
-			if interp.returning || interp.nexting || interp.nextfiling || interp.exiting {
+			if interp.returning || interp.exiting {
 				return
 			}
 			if st.Post != nil {
@@ -404,12 +333,10 @@ func (interp *Interpreter) execStmt(s Stmt, scope *Scope) {
 		if arr == nil || !arr.isArray() {
 			return
 		}
-		// Collect keys to avoid map modification during iteration
 		keys := make([]string, 0, len(arr.arr))
 		for k := range arr.arr {
 			keys = append(keys, k)
 		}
-		// Don't sort for natural order (like awk)
 		for _, k := range keys {
 			interp.assignExpr(st.Var, strVal(k), scope)
 			interp.execAction(st.Body, scope)
@@ -421,7 +348,7 @@ func (interp *Interpreter) execStmt(s Stmt, scope *Scope) {
 				interp.continuing = false
 				continue
 			}
-			if interp.returning || interp.nexting || interp.nextfiling || interp.exiting {
+			if interp.returning || interp.exiting {
 				return
 			}
 		}
@@ -430,26 +357,18 @@ func (interp *Interpreter) execStmt(s Stmt, scope *Scope) {
 		interp.execDelete(st.Expr, scope)
 
 	case *ReturnStmt:
-		var v *Value
 		if st.Value != nil {
-			v = interp.evalExpr(st.Value, scope)
+			interp.returnVal = interp.evalExpr(st.Value, scope)
 		} else {
-			v = &Value{kind: kindUninitialized}
+			interp.returnVal = &Value{kind: kindUninitialized}
 		}
 		interp.returning = true
-		interp.returnVal = v
 
 	case *BreakStmt:
 		interp.breaking = true
 
 	case *ContinueStmt:
 		interp.continuing = true
-
-	case *NextStmt:
-		interp.nexting = true
-
-	case *NextfileStmt:
-		interp.nextfiling = true
 
 	case *ExitStmt:
 		code := 0
@@ -461,77 +380,78 @@ func (interp *Interpreter) execStmt(s Stmt, scope *Scope) {
 	case *BlockStmt:
 		interp.execAction(st.Body, scope)
 
-	// Structural regex statements
-	case *XStmt:
-		interp.execXStmt(st, scope)
+	// Inner x-expression: /re/ { } inside a block.
+	// Iterates over all non-overlapping matches of Regex within current $0.
+	case *RegexStmt:
+		interp.execRegexStmt(st, scope)
+
+	// y/re/ { } — gap iteration (extension).
 	case *YStmt:
 		interp.execYStmt(st, scope)
-	case *GStmt:
-		if matchRegex(st.Regex, interp.currentText) {
-			interp.execAction(st.Body, scope)
-		}
-	case *VStmt:
-		if !matchRegex(st.Regex, interp.currentText) {
-			interp.execAction(st.Body, scope)
-		}
 	}
 }
 
-func (interp *Interpreter) execXStmt(st *XStmt, scope *Scope) {
-	interp.execStructural(structuralExtract(st.Regex, interp.currentText), st.Body, scope)
-}
-
-func (interp *Interpreter) execYStmt(st *YStmt, scope *Scope) {
-	interp.execStructural(structuralGaps(st.Regex, interp.currentText), st.Body, scope)
-}
-
-// execStructural runs action for each span [start,end) in the current text.
+// execRegexStmt executes an inner x-expression: /re/ { stmts } inside a block.
+// Iterates over all non-overlapping matches of Regex within the current $0.
+// Pushes a new MatchState for each match; pops it after the body runs.
 // break/continue are consumed locally (scoped to the match loop).
-// next/nextfile/exit propagate outward to the record or program level.
-func (interp *Interpreter) execStructural(spans [][]int, action []Stmt, scope *Scope) {
-	text := interp.currentText
-	saved := interp.savedState()
-	for _, sp := range spans {
-		segment := text[sp[0]:sp[1]]
-		if segment == "" {
-			continue
-		}
-		interp.currentText = segment
-		interp.splitRecord(segment)
-		interp.execAction(action, scope)
+// exit propagates upward.
+func (interp *Interpreter) execRegexStmt(st *RegexStmt, scope *Scope) {
+	re := compileDotAll(st.Regex)
+	text := interp.currentMatch().Text
+	all := re.FindAllStringSubmatchIndex(text, -1)
+	for _, m := range all {
+		ms := matchStateFromRegex(re, text, m)
+		interp.pushMatch(ms)
+		interp.execAction(st.Action, scope)
+		interp.popMatch()
 		if interp.breaking {
-			interp.breaking = false // consumed: exits match loop, not outer rule
+			interp.breaking = false
 			break
 		}
 		if interp.continuing {
-			interp.continuing = false // consumed: next match
+			interp.continuing = false
 			continue
 		}
-		if interp.returning || interp.nexting || interp.nextfiling || interp.exiting {
-			break // propagate upward
+		if interp.returning || interp.exiting {
+			break
 		}
 	}
-	interp.restoreState(saved)
 }
 
-type savedStateT struct {
-	text   string
-	fields []*Value
-	nf     float64
-}
+// execYStmt executes y/re/ { stmts } — gap iteration.
+// Iterates over the gaps between matches of Regex within the current $0.
+// Includes all gaps including empty ones (e.g., trailing gap after last match).
+// Pushes a new MatchState for each gap; pops it after the body runs.
+func (interp *Interpreter) execYStmt(st *YStmt, scope *Scope) {
+	re := compileDotAll(st.Regex)
+	text := interp.currentMatch().Text
+	matches := re.FindAllStringIndex(text, -1)
 
-func (interp *Interpreter) savedState() savedStateT {
-	fs := make([]*Value, len(interp.fields))
-	copy(fs, interp.fields)
-	return savedStateT{interp.currentText, fs, interp.NF}
-}
+	// Collect all gaps (including empty ones).
+	prev := 0
+	var gaps []string
+	for _, m := range matches {
+		gaps = append(gaps, text[prev:m[0]]) // may be empty if match at start
+		prev = m[1]
+	}
+	gaps = append(gaps, text[prev:]) // trailing gap (may be empty)
 
-func (interp *Interpreter) restoreState(s savedStateT) {
-	interp.currentText = s.text
-	interp.fields = s.fields
-	interp.NF = s.nf
-	if len(interp.fields) > 0 {
-		interp.fields[0] = numStr(s.text)
+	for _, gap := range gaps {
+		interp.pushMatch(MatchState{Text: gap})
+		interp.execAction(st.Body, scope)
+		interp.popMatch()
+		if interp.breaking {
+			interp.breaking = false
+			break
+		}
+		if interp.continuing {
+			interp.continuing = false
+			continue
+		}
+		if interp.returning || interp.exiting {
+			break
+		}
 	}
 }
 
@@ -572,8 +492,8 @@ func (interp *Interpreter) evalExpr(e Expr, scope *Scope) *Value {
 		return strVal(ex.Val)
 
 	case *RegexExpr:
-		// Unanchored regex match against $0
-		if matchRegex(ex.Pattern, interp.currentText) {
+		// /pattern/ as an expression: test match against $0 (current match text).
+		if matchRegex(ex.Pattern, interp.currentMatch().Text) {
 			return numVal(1)
 		}
 		return numVal(0)
@@ -584,6 +504,16 @@ func (interp *Interpreter) evalExpr(e Expr, scope *Scope) *Value {
 	case *FieldExpr:
 		idx := int(interp.evalExpr(ex.Index, scope).toNumber())
 		return interp.getField(idx)
+
+	case *NamedGroupExpr:
+		// $name — look up named capture group in top of match stack.
+		ms := interp.currentMatch()
+		if ms.NamedGroups != nil {
+			if v, ok := ms.NamedGroups[ex.Name]; ok {
+				return strVal(v)
+			}
+		}
+		return strVal("")
 
 	case *IndexExpr:
 		arr := interp.getOrCreateArray(ex.Array, scope)
@@ -612,18 +542,15 @@ func (interp *Interpreter) evalExpr(e Expr, scope *Scope) *Value {
 		return interp.evalIncrDecr(ex, scope)
 
 	case *TernaryExpr:
-		cond := interp.evalExpr(ex.Cond, scope)
-		if cond.toBool() {
+		if interp.evalExpr(ex.Cond, scope).toBool() {
 			return interp.evalExpr(ex.Then, scope)
 		}
 		return interp.evalExpr(ex.Else, scope)
 
 	case *ConcatExpr:
-		left := interp.evalExpr(ex.Left, scope)
-		right := interp.evalExpr(ex.Right, scope)
-		ls := left.toStringFmt(interp.OFMT)
-		rs := right.toStringFmt(interp.OFMT)
-		return strVal(ls + rs)
+		left := interp.evalExpr(ex.Left, scope).toStringFmt(interp.OFMT)
+		right := interp.evalExpr(ex.Right, scope).toStringFmt(interp.OFMT)
+		return strVal(left + right)
 
 	case *CallExpr:
 		return interp.evalCall(ex, scope)
@@ -636,24 +563,33 @@ func (interp *Interpreter) evalExpr(e Expr, scope *Scope) *Value {
 		if arr == nil || !arr.isArray() {
 			return numVal(0)
 		}
-		var key string
-		// Handle multi-dimensional via ConcatExpr
 		switch k := ex.Key.(type) {
 		case *ConcatExpr:
-			// Multi-dimensional: evaluate and join with SUBSEP
 			parts := interp.flattenConcat(k, scope)
 			keys := make([]string, len(parts))
 			for i, p := range parts {
 				keys[i] = p.toString()
 			}
-			key = strings.Join(keys, interp.SUBSEP)
+			key := strings.Join(keys, interp.SUBSEP)
+			if _, ok := arr.arr[key]; ok {
+				return numVal(1)
+			}
+			return numVal(0)
 		default:
-			key = interp.evalExpr(k, scope).toString()
+			key := interp.evalExpr(k, scope).toString()
+			if _, ok := arr.arr[key]; ok {
+				return numVal(1)
+			}
+			return numVal(0)
 		}
-		if _, ok := arr.arr[key]; ok {
-			return numVal(1)
+
+	case *MatchExpr:
+		v := interp.evalExpr(ex.Operand, scope)
+		matched := matchRegex(ex.Pattern, v.toString())
+		if ex.Negate {
+			matched = !matched
 		}
-		return numVal(0)
+		return boolVal(matched)
 	}
 
 	return &Value{kind: kindUninitialized}
@@ -671,9 +607,8 @@ func (interp *Interpreter) flattenConcat(e *ConcatExpr, scope *Scope) []*Value {
 }
 
 func (interp *Interpreter) arrayName(e Expr) string {
-	switch ex := e.(type) {
-	case *IdentExpr:
-		return ex.Name
+	if id, ok := e.(*IdentExpr); ok {
+		return id.Name
 	}
 	return ""
 }
@@ -681,14 +616,16 @@ func (interp *Interpreter) arrayName(e Expr) string {
 func (interp *Interpreter) getOrCreateArray(e Expr, scope *Scope) *Value {
 	name := interp.arrayName(e)
 	v := interp.getVar(name, scope)
+	if v != nil && v.isArray() {
+		return v // already an array
+	}
 	if v == nil {
 		v = arrayVal()
 		interp.setVar(name, v, scope)
-	} else if !v.isArray() && v.kind == kindUninitialized {
-		// Convert the existing Value to an array IN PLACE.
-		// This preserves reference-sharing for arrays passed as function parameters.
-		v.arr = make(map[string]*Value)
+		return v
 	}
+	// Uninitialized scalar: convert in-place so existing references see the array.
+	v.arr = make(map[string]*Value)
 	return v
 }
 
@@ -696,10 +633,7 @@ func (interp *Interpreter) evalUnary(ex *UnaryExpr, scope *Scope) *Value {
 	v := interp.evalExpr(ex.Operand, scope)
 	switch ex.Op {
 	case "!":
-		if v.toBool() {
-			return numVal(0)
-		}
-		return numVal(1)
+		return boolVal(!v.toBool())
 	case "-":
 		return numVal(-v.toNumber())
 	case "+":
@@ -711,35 +645,29 @@ func (interp *Interpreter) evalUnary(ex *UnaryExpr, scope *Scope) *Value {
 func (interp *Interpreter) evalBinary(ex *BinaryExpr, scope *Scope) *Value {
 	switch ex.Op {
 	case "&&":
-		left := interp.evalExpr(ex.Left, scope)
-		if !left.toBool() {
+		if !interp.evalExpr(ex.Left, scope).toBool() {
 			return numVal(0)
 		}
-		right := interp.evalExpr(ex.Right, scope)
-		if right.toBool() {
+		if interp.evalExpr(ex.Right, scope).toBool() {
 			return numVal(1)
 		}
 		return numVal(0)
 	case "||":
-		left := interp.evalExpr(ex.Left, scope)
-		if left.toBool() {
+		if interp.evalExpr(ex.Left, scope).toBool() {
 			return numVal(1)
 		}
-		right := interp.evalExpr(ex.Right, scope)
-		if right.toBool() {
+		if interp.evalExpr(ex.Right, scope).toBool() {
 			return numVal(1)
 		}
 		return numVal(0)
-	}
-
-	// Special case: regex match/nomatch — extract pattern without evaluating RHS as bool
-	if ex.Op == "~" || ex.Op == "!~" {
+	case "~", "!~":
 		left := interp.evalExpr(ex.Left, scope)
 		pattern := interp.extractPattern(ex.Right, scope)
-		if ex.Op == "~" {
-			return boolVal(matchRegex(pattern, left.toString()))
+		matched := matchRegex(pattern, left.toString())
+		if ex.Op == "!~" {
+			matched = !matched
 		}
-		return boolVal(!matchRegex(pattern, left.toString()))
+		return boolVal(matched)
 	}
 
 	left := interp.evalExpr(ex.Left, scope)
@@ -778,25 +706,18 @@ func (interp *Interpreter) evalBinary(ex *BinaryExpr, scope *Scope) *Value {
 		return boolVal(compare(left, right) == 0)
 	case "!=":
 		return boolVal(compare(left, right) != 0)
-	// ~ and !~ handled above with extractPattern
 	case "in":
-		// key in array
-		arr := right
-		if !arr.isArray() {
-			return numVal(0)
-		}
-		key := left.toString()
-		if _, ok := arr.arr[key]; ok {
-			return numVal(1)
+		if right.isArray() {
+			key := left.toString()
+			if _, ok := right.arr[key]; ok {
+				return numVal(1)
+			}
 		}
 		return numVal(0)
 	}
 	return numVal(0)
 }
 
-// extractPattern extracts a regex pattern string from an expr.
-// For RegexExpr literals like /foo/, returns the pattern directly.
-// For other exprs, evaluates and converts to string.
 func (interp *Interpreter) extractPattern(e Expr, scope *Scope) string {
 	if re, ok := e.(*RegexExpr); ok {
 		return re.Pattern
@@ -804,7 +725,6 @@ func (interp *Interpreter) extractPattern(e Expr, scope *Scope) string {
 	return interp.evalExpr(e, scope).toString()
 }
 
-// gsub/sub also need to handle regex pattern in first arg
 func extractStaticPattern(e Expr) (string, bool) {
 	if re, ok := e.(*RegexExpr); ok {
 		return re.Pattern, true
@@ -876,14 +796,11 @@ func (interp *Interpreter) assignExpr(lval Expr, v *Value, scope *Scope) {
 func (interp *Interpreter) evalIncrDecr(ex *IncrDecrExpr, scope *Scope) *Value {
 	cur := interp.evalExpr(ex.Operand, scope)
 	n := cur.toNumber()
-	var delta float64
-	if ex.Op == "++" {
-		delta = 1
-	} else {
+	delta := 1.0
+	if ex.Op == "--" {
 		delta = -1
 	}
-	newN := n + delta
-	newVal := numVal(newN)
+	newVal := numVal(n + delta)
 	interp.assignExpr(ex.Operand, newVal, scope)
 	if ex.Pre {
 		return newVal
@@ -894,17 +811,14 @@ func (interp *Interpreter) evalIncrDecr(ex *IncrDecrExpr, scope *Scope) *Value {
 // --- Variable access ---
 
 func (interp *Interpreter) getVar(name string, scope *Scope) *Value {
-	// Check special variables
 	if v, ok := interp.getSpecialVar(name); ok {
 		return v
 	}
-	// Check local scope
 	if scope != nil {
 		if v := scope.getLocal(name); v != nil {
 			return v
 		}
 	}
-	// Check global
 	return interp.global.get(name)
 }
 
@@ -920,59 +834,44 @@ func (interp *Interpreter) setVar(name string, val *Value, scope *Scope) {
 // --- Print ---
 
 func (interp *Interpreter) execPrint(st *PrintStmt, scope *Scope) {
-	var parts []string
-	if len(st.Args) == 0 {
-		parts = []string{interp.getField(0).toString()}
-	} else {
-		for _, arg := range st.Args {
-			v := interp.evalExpr(arg, scope)
-			if st.Printf {
-				// For printf, handled below
-				parts = append(parts, v.toStringFmt(interp.OFMT))
-			} else {
-				parts = append(parts, v.toStringFmt(interp.OFMT))
-			}
-		}
-	}
+	w := interp.getOutput(st.Redir, scope)
 
-	var output string
 	if st.Printf {
-		if len(parts) == 0 {
-			panic(runtimeError("Empty sequence"))
-		}
 		format := ""
 		if len(st.Args) > 0 {
 			format = interp.evalExpr(st.Args[0], scope).toString()
 		}
-		args := make([]interface{}, len(st.Args)-1)
-		for i, a := range st.Args[1:] {
-			args[i] = interp.evalExpr(a, scope)
+		args := make([]interface{}, 0, len(st.Args)-1)
+		for _, a := range st.Args[1:] {
+			args = append(args, interp.evalExpr(a, scope))
 		}
-		output = sprintfAWK(format, args, interp.OFMT)
-	} else {
-		output = strings.Join(parts, interp.OFS) + interp.ORS
+		fmt.Fprint(w, awkSprintf(format, args, interp.OFMT))
+		return
 	}
 
-	w := interp.getOutput(st.Redir, scope)
-	fmt.Fprint(w, output)
+	if len(st.Args) == 0 {
+		// print with no args prints $0 (current match text).
+		fmt.Fprint(w, interp.getField(0).toString()+interp.ORS)
+		return
+	}
+	parts := make([]string, len(st.Args))
+	for i, arg := range st.Args {
+		parts[i] = interp.evalExpr(arg, scope).toStringFmt(interp.OFMT)
+	}
+	fmt.Fprint(w, strings.Join(parts, interp.OFS)+interp.ORS)
 }
 
 // --- Function calls ---
 
 func (interp *Interpreter) evalCall(ex *CallExpr, scope *Scope) *Value {
-	// Check user-defined functions first
 	if fn, ok := interp.prog.Funcs[ex.Name]; ok {
 		return interp.callUserFunc(fn, ex.Args, scope)
 	}
-	// Built-in functions
 	return interp.callBuiltin(ex.Name, ex.Args, scope)
 }
 
 func (interp *Interpreter) callUserFunc(fn *FuncDef, args []Expr, scope *Scope) *Value {
-	// Create new scope for the function
 	fScope := newScope(interp.global)
-
-	// Bind parameters
 	for i, param := range fn.Params {
 		var val *Value
 		if i < len(args) {
@@ -982,10 +881,7 @@ func (interp *Interpreter) callUserFunc(fn *FuncDef, args []Expr, scope *Scope) 
 		}
 		fScope.setLocal(param, val)
 	}
-
-	// Execute the function body
 	interp.execAction(fn.Body, fScope)
-
 	ret := interp.returnVal
 	interp.returning = false
 	interp.returnVal = nil
@@ -996,9 +892,11 @@ func (interp *Interpreter) callUserFunc(fn *FuncDef, args []Expr, scope *Scope) 
 }
 
 // --- Getline ---
+// Plain getline (from main input) is not supported in stream mode.
+// getline from file or pipe is supported.
 
 func (interp *Interpreter) evalGetline(ex *GetlineExpr, scope *Scope) *Value {
-	// getline from pipe: cmd | getline [var]
+	// cmd | getline [var]
 	if ex.Cmd != nil {
 		cmd := interp.evalExpr(ex.Cmd, scope).toString()
 		reader := interp.getPipeReader(cmd)
@@ -1015,14 +913,12 @@ func (interp *Interpreter) evalGetline(ex *GetlineExpr, scope *Scope) *Value {
 		if ex.Var != nil {
 			interp.assignExpr(ex.Var, numStr(line), scope)
 		} else {
-			interp.splitRecord(line)
-			interp.currentText = line
+			interp.setDollarZero(line)
 		}
-		interp.NR++
 		return numVal(1)
 	}
 
-	// getline < file [into var]
+	// getline [var] < file
 	if ex.File != nil {
 		filename := interp.evalExpr(ex.File, scope).toString()
 		reader := interp.getFileReader(filename)
@@ -1034,39 +930,29 @@ func (interp *Interpreter) evalGetline(ex *GetlineExpr, scope *Scope) *Value {
 			if err == io.EOF {
 				return numVal(0)
 			}
-			interp.ERRNO = 1
 			return numVal(-1)
 		}
 		if ex.Var != nil {
 			interp.assignExpr(ex.Var, numStr(line), scope)
 		} else {
-			interp.splitRecord(line)
-			interp.currentText = line
+			interp.setDollarZero(line)
 		}
 		return numVal(1)
 	}
 
-	// Plain getline [var] — reads from current input stream
-	if interp.currentScanner == nil {
-		return numVal(-1)
+	// Plain getline from main input: not supported.
+	panic(runtimeError("plain getline not supported in stream mode; use getline < file or cmd | getline"))
+}
+
+// setDollarZero sets $0 to line, mutating the match stack top.
+// Used by getline when no variable is specified.
+func (interp *Interpreter) setDollarZero(line string) {
+	if len(interp.matchStack) > 0 {
+		top := &interp.matchStack[len(interp.matchStack)-1]
+		top.Text = line
+		top.Groups = nil
+		top.NamedGroups = nil
 	}
-	line, err := readLine(interp.currentScanner)
-	if err == io.EOF {
-		return numVal(0)
-	}
-	if err != nil {
-		interp.ERRNO = 1
-		return numVal(-1)
-	}
-	interp.NR++
-	interp.FNR++
-	if ex.Var != nil {
-		interp.assignExpr(ex.Var, numStr(line), scope)
-	} else {
-		interp.splitRecord(line)
-		interp.currentText = line
-	}
-	return numVal(1)
 }
 
 // --- Utility ---
@@ -1091,16 +977,11 @@ func readLine(r io.Reader) (string, error) {
 	}
 }
 
-// sprintfAWK formats a string like AWK's printf.
 func sprintfAWK(format string, args []interface{}, ofmt string) string {
 	return awkSprintf(format, args, ofmt)
 }
 
 // --- Output management ---
-
-type outputDest struct {
-	w io.Writer
-}
 
 func (interp *Interpreter) getOutput(redir *Redirect, scope *Scope) io.Writer {
 	if redir == nil {
@@ -1139,7 +1020,6 @@ func (interp *Interpreter) getOutput(redir *Redirect, scope *Scope) io.Writer {
 	default:
 		w = os.Stdout
 	}
-
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cawk: cannot open %s: %v\n", dest, err)
 		return os.Stderr
@@ -1160,12 +1040,6 @@ func (interp *Interpreter) closeAll() {
 	}
 }
 
-// --- Pipe and file input ---
-
-type pipeReader struct {
-	reader io.Reader
-}
-
 func (interp *Interpreter) getPipeReader(cmd string) io.Reader {
 	key := "|:" + cmd
 	if r, ok := interp.pipes[key]; ok {
@@ -1178,32 +1052,22 @@ func (interp *Interpreter) getPipeReader(cmd string) io.Reader {
 	return pr
 }
 
-type fileReaderEntry struct {
-	r io.Reader
-}
-
 func (interp *Interpreter) getFileReader(filename string) io.Reader {
 	key := "<:" + filename
 	if r, ok := interp.files[key]; ok {
 		return r.(io.Reader)
 	}
-	var r io.Reader
 	if filename == "-" {
-		r = os.Stdin
-	} else {
-		f, err := os.Open(filename)
-		if err != nil {
-			interp.ERRNO = float64(mapErrno(err))
-			return nil
-		}
-		r = f
-		interp.files[key] = f
+		interp.files[key] = os.Stdin
+		return os.Stdin
 	}
-	interp.files[key] = r
-	return r
+	f, err := os.Open(filename)
+	if err != nil {
+		return nil
+	}
+	interp.files[key] = f
+	return f
 }
-
-// --- Misc ---
 
 func mapErrno(err error) int {
 	if os.IsNotExist(err) {
@@ -1212,10 +1076,8 @@ func mapErrno(err error) int {
 	return 1
 }
 
-// Provide random number for rand() — seeded once
 var rng = rand.New(rand.NewSource(1))
 
-// sortKeys returns sorted map keys.
 func sortKeys(m map[string]*Value) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
@@ -1225,7 +1087,6 @@ func sortKeys(m map[string]*Value) []string {
 	return keys
 }
 
-// formatInt formats n as an integer if possible.
 func formatInt(n float64) string {
 	if n == math.Trunc(n) && !math.IsInf(n, 0) && math.Abs(n) < 1e15 {
 		return strconv.FormatInt(int64(n), 10)
@@ -1233,5 +1094,4 @@ func formatInt(n float64) string {
 	return strconv.FormatFloat(n, 'g', 6, 64)
 }
 
-// Needed in scope.go
-var _ = sort.Strings
+var _ = sort.Strings // keep import
