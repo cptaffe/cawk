@@ -1,5 +1,7 @@
 # Bug: top-level /regex/ patterns cannot match newlines in $0
 
+**Status: RESOLVED** — Fixed by x-expression semantics (commit 42672a7).
+
 ## Summary
 
 Standard AWK strips the record terminator before assigning `$0`, so a
@@ -9,7 +11,7 @@ that wants to treat the stream as structured text (e.g. a line-oriented
 event dispatcher), this makes it impossible to anchor patterns to a
 complete record boundary using `\n`.
 
-## Reproduction
+## Reproduction (old cawk)
 
 ```awk
 # prog.awk
@@ -23,45 +25,44 @@ matched without newline
 matched without newline
 ```
 
-Only the `^hello$` pattern fires.  The `hello\n` pattern never matches
-because `$0` is `"hello"`, not `"hello\n"`.
+Only the `^hello$` pattern fired because `/hello\n/` was evaluated as an
+expression pattern against `$0 = "hello"` (no trailing newline), so the
+literal `\n` in the regex could never match.
 
-## Expected behaviour
+## Resolution
 
-cawk extends AWK with structural regular expressions that treat input as
-a character stream.  In that model it is natural to write a pattern that
-spans a record boundary, e.g. `/foo\nbar/` to match two consecutive
-lines.  At minimum, `/hello\n/` ought to match a line whose content is
-`hello`, with the `\n` acting as an end-of-record anchor (equivalent to
-`$` in standard AWK).
+cawk now uses **x-expression semantics** for all top-level `/re/` rules.
+The pattern is matched anchored against the raw input stream (not against a
+pre-split line), so `/hello\n/` correctly consumes the sequence `"hello\n"`
+as a single token.
 
-Two possible fixes:
+```
+$ printf 'hello\nworld\n' | cawk -f prog.awk
+matched with newline
+```
 
-1. **Retain the newline in `$0`** for pattern matching (breaking AWK
-   compatibility for programs that print `$0` and expect no double
-   newline, but correct for stream-oriented use).
+- `/hello\n/` fires once, consuming `"hello\n"`.  `$0 = "hello\n"` (the
+  matched bytes, including the newline).
+- `/^hello$/` never fires: `$` in x-expression mode is end-of-stream, not
+  end-of-line.
+- `"world\n"` is consumed silently (no matching rule).
 
-2. **Treat `\n` in a pattern as `$`** when the pattern is applied
-   against a line-split record — i.e. normalise `/foo\n/` to `/foo$/`
-   before matching.  This is backward-compatible with standard AWK
-   behaviour.
+## Hotkeys idiom
 
-3. **Add a stream mode** (e.g. `-0` flag or `RS=""`) in which cawk does
-   not split on newlines at all and applies patterns to the raw byte
-   stream, letting structural regex operate across record boundaries.
+The original motivating case (line-oriented event dispatcher) now works
+directly:
 
-## Context
+```awk
+/command s\n/  { printf "!%s", $0 }   # drop: $0 = "command s\n"; printf avoids double-newline
+/command w\n/  { printf "!%s", $0 }
+{ print $0 }                           # forward: bare block strips \n, print re-adds via ORS
+```
 
-Discovered while writing a line-oriented 9P event dispatcher
-(`hotkeys.cawk`) that sits between a keyboard daemon and Acme.  Each
-event is one line (e.g. `command n`).  The script used patterns of the
-form `/command n\n/` intending to match exactly the line `command n`,
-but every event fell through to the catch-all and was forwarded
-unchanged.  Switching to `/^command n$/` fixed the problem.
+`printf "!%s", $0` is used instead of `print "!" $0` because `$0` already
+contains the trailing newline consumed by the pattern; `print` would add a
+second one via ORS.
 
-The cawk README describes structural operations (`x`, `y`, `g`, `v`) as
-working on the *current text* (`$0`), which correctly implies that `\n`
-is not present.  However the structural-regex mental model leads users to
-expect that `\n` in a top-level pattern will match the line terminator,
-since it does in sam, sed, and most other tools that expose structural
-regex.
+## Regression tests
+
+See `TestBugNewlineInTopLevelPattern`, `TestBugDollarZeroIncludesNewline`,
+`TestBugEventDispatchPattern`, and `TestBugMultilineXExpr` in `awk_test.go`.
