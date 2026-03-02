@@ -248,12 +248,21 @@ func (interp *Interpreter) tryRule(rule *Rule, buf []byte, pos int, eof bool) (i
 	return adv, true
 }
 
+// reCache memoises compiled regexes so we pay the compilation cost once per
+// unique pattern string rather than once per stream position per rule.
+// The evaluator is single-threaded so no locking is needed.
+var reCache = map[string]*regexp.Regexp{}
+
 // compileDotAll compiles a regex with (?s) so . matches \n.
 func compileDotAll(pattern string) *regexp.Regexp {
+	if re, ok := reCache[pattern]; ok {
+		return re
+	}
 	re, err := regexp.Compile("(?s)" + pattern)
 	if err != nil {
 		panic(runtimeError(fmt.Sprintf("bad regex %q: %v", pattern, err)))
 	}
+	reCache[pattern] = re
 	return re
 }
 
