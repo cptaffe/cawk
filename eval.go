@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"fmt"
 	"io"
@@ -101,80 +100,65 @@ func (interp *Interpreter) mainRules() []*Rule {
 //
 // At each stream position, rules are tried in order. The first matching
 // rule fires: $0 = the match, stream advances by len($0). If no rule
-// matches, advance one byte (silent skip — Pike's sparse coverage model).
+// matches at the current position, one more read is attempted — giving
+// multi-line patterns a chance to see their second line — before silently
+// advancing one byte (Pike's sparse coverage model).
 //
-// Before trying rules, the buffer is pre-filled with enough complete lines
-// to satisfy the deepest multi-line regex in the program. This ensures a
-// multi-line /foo\nbar\n/ always sees both lines before a catch-all bare
-// block gets a chance to consume "foo".
+// No line-counting or lookahead heuristic: the buffer is filled with
+// whatever each Read() call returns (pipe writes are typically atomic;
+// file reads come in large chunks). This keeps latency minimal for
+// event-per-line patterns like /command s\n/.
 func (interp *Interpreter) scanStream(r io.Reader, filename string) {
 	interp.FILENAME = filename
-	br := bufio.NewReader(r)
 
 	var buf []byte
 	pos := 0
 	eof := false
 
-	readLine := func() bool {
+	// fill appends one Read()-worth of data to buf.
+	// Returns true if any bytes were added.
+	//
+	// We use r directly rather than bufio.Reader: bufio defers a combined
+	// (n, io.EOF) return into two calls — (n, nil) then (0, io.EOF) — which
+	// means eof is set one fill() call later than expected, causing us to
+	// advance past the first byte before the bare-block EOF path can fire.
+	fill := func() bool {
 		if eof {
 			return false
 		}
-		line, err := br.ReadBytes('\n')
-		if len(line) > 0 {
-			buf = append(buf, line...)
+		tmp := make([]byte, 4096)
+		n, err := r.Read(tmp)
+		if n > 0 {
+			buf = append(buf, tmp[:n]...)
 		}
 		if err != nil {
 			eof = true
 		}
-		return len(line) > 0
+		return n > 0
 	}
 
 	rules := interp.mainRules()
 
-	// Compute the maximum number of complete lines any regex pattern needs
-	// before we attempt matches at the current stream position.
-	//
-	// A pattern with K literal \n escape sequences spans K+1 lines — UNLESS
-	// it ends with \n, in which case the match is complete at the final
-	// newline and no look-ahead into the next line is required.
-	//
-	// Examples:
-	//   /foo/        → 0 \n, no trailing \n  → need 1 line  (0+1)
-	//   /foo\n/      → 1 \n, trailing \n     → need 1 line  (1, not 1+1)
-	//   /foo\nbar/   → 1 \n, no trailing \n  → need 2 lines (1+1)
-	//   /foo\nbar\n/ → 2 \n, trailing \n     → need 2 lines (2, not 2+1)
-	//
-	// Getting this wrong (always +1) causes a one-event latency on any pipe
-	// where stdin stays open: ensureLines blocks waiting for the NEXT line
-	// before it will fire the rule that already has a complete match.
-	lookahead := 1
-	for _, rule := range rules {
-		n := strings.Count(rule.Regex, `\n`)
-		if !strings.HasSuffix(rule.Regex, `\n`) {
-			n++ // pattern extends past its last \n; need one more buffered line
-		}
-		if n > lookahead {
-			lookahead = n
-		}
-	}
-
-	ensureLines := func(n int) {
-		for !eof {
-			if bytes.Count(buf[pos:], []byte{'\n'}) >= n {
-				break
-			}
-			if !readLine() {
-				break
-			}
-		}
-	}
+	// Prime the buffer.
+	fill()
 
 	for {
-		ensureLines(lookahead)
-		if pos >= len(buf) {
-			break
+		// Compact: drop processed bytes once enough have accumulated
+		// so we don't hold onto the whole input in memory forever.
+		if pos > 1<<16 {
+			buf = buf[pos:]
+			pos = 0
 		}
 
+		// Refill if the buffer is empty.
+		if pos >= len(buf) {
+			if !fill() {
+				break
+			}
+			continue
+		}
+
+		// Try every rule at the current position.
 		fired := false
 		for _, rule := range rules {
 			adv, ok := interp.tryRule(rule, buf, pos, eof)
@@ -185,10 +169,27 @@ func (interp *Interpreter) scanStream(r io.Reader, filename string) {
 			}
 		}
 
-		if !fired {
-			// No rule matched: advance one byte (silent sparse advance).
-			pos++
+		if fired {
+			if interp.exiting {
+				return
+			}
+			continue
 		}
+
+		// No rule matched. Read more data (or discover EOF) then retry
+		// before concluding this position is unmatched.
+		//
+		// "continue" unconditionally after fill() because fill() may
+		// have added 0 bytes but flipped eof=true — in that case tryRule
+		// needs another shot with the updated eof flag so the bare-block
+		// EOF path (no trailing newline) can fire.
+		if !eof {
+			fill()
+			continue
+		}
+
+		// Truly unmatched at EOF: silent advance.
+		pos++
 
 		if interp.exiting {
 			return
