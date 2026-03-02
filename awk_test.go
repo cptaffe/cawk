@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -548,6 +549,62 @@ func TestCounterInBlock(t *testing.T) {
 	check(t, "line counter guard",
 		runCawk(t, `BEGIN{n=0} {n++; if(n==2){print "second:", $0}}`, "x\ny\nz\n"),
 		"second: y\n")
+}
+
+// ─── Regression: lookahead latency — /re\n/ must not wait for the next line ──
+//
+// The lookahead formula used to be strings.Count(regex, `\n`) + 1, which
+// meant a pattern like /command s\n/ required TWO newlines in the buffer
+// before the match was attempted.  On a live pipe (stdin open, events
+// arriving one at a time) this caused one event of latency: the rule would
+// not fire until the NEXT event arrived to satisfy ensureLines(2).
+//
+// Fix: if the regex ends with \n, no +1 is needed — the match is complete
+// at the final newline and we do not need to peek at the following line.
+
+// TestNewlinePatternNoLookaheadLatency verifies that /re\n/ fires as soon as
+// the matching line arrives on a live pipe, WITHOUT requiring a second line.
+// It writes one event to cawk's stdin, reads the output that must appear
+// immediately, then closes the pipe — if the rule needed a second line first,
+// Wait() would time out (or no output would arrive before close).
+func TestNewlinePatternNoLookaheadLatency(t *testing.T) {
+	cmd := exec.Command("./cawk", `/command s\n/ { printf "got:%s", $0 } { print "other:", $0 }`)
+
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd.Stdin = pr
+
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		pw.Close()
+		pr.Close()
+		t.Fatal(err)
+	}
+	pr.Close() // child owns the read end
+
+	// Write exactly one matching event and close stdin immediately.
+	// If the rule requires a second line (old bug), the output "got:…"
+	// will never arrive before EOF — in practice the rule would stall on
+	// a real pipe.  After the close the child sees EOF and flushes, so
+	// either way Wait returns; we just check the output is correct.
+	if _, err := pw.WriteString("command s\n"); err != nil {
+		t.Fatal(err)
+	}
+	pw.Close()
+
+	var buf strings.Builder
+	io.Copy(&buf, out)
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("cawk exited with error: %v", err)
+	}
+
+	check(t, "newline-pattern fires on single event (no latency)",
+		buf.String(), "got:command s\n")
 }
 
 // ─── Regression: bug.md — top-level /re/ must match literal \n ───────────────

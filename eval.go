@@ -131,10 +131,29 @@ func (interp *Interpreter) scanStream(r io.Reader, filename string) {
 
 	rules := interp.mainRules()
 
-	// Compute the maximum number of complete lines any regex pattern needs.
+	// Compute the maximum number of complete lines any regex pattern needs
+	// before we attempt matches at the current stream position.
+	//
+	// A pattern with K literal \n escape sequences spans K+1 lines — UNLESS
+	// it ends with \n, in which case the match is complete at the final
+	// newline and no look-ahead into the next line is required.
+	//
+	// Examples:
+	//   /foo/        → 0 \n, no trailing \n  → need 1 line  (0+1)
+	//   /foo\n/      → 1 \n, trailing \n     → need 1 line  (1, not 1+1)
+	//   /foo\nbar/   → 1 \n, no trailing \n  → need 2 lines (1+1)
+	//   /foo\nbar\n/ → 2 \n, trailing \n     → need 2 lines (2, not 2+1)
+	//
+	// Getting this wrong (always +1) causes a one-event latency on any pipe
+	// where stdin stays open: ensureLines blocks waiting for the NEXT line
+	// before it will fire the rule that already has a complete match.
 	lookahead := 1
 	for _, rule := range rules {
-		if n := strings.Count(rule.Regex, `\n`) + 1; n > lookahead {
+		n := strings.Count(rule.Regex, `\n`)
+		if !strings.HasSuffix(rule.Regex, `\n`) {
+			n++ // pattern extends past its last \n; need one more buffered line
+		}
+		if n > lookahead {
 			lookahead = n
 		}
 	}
