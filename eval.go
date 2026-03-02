@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 	"math"
@@ -137,7 +136,9 @@ func (interp *Interpreter) scanStream(r io.Reader, filename string) {
 		return n > 0
 	}
 
-	rules := interp.mainRules()
+	// Build the combined NFA once: a single stitched *syntax.Prog that
+	// tries all rules in source order with one NFA pass per stream position.
+	cn := buildCombinedNFA(interp.mainRules())
 
 	// Prime the buffer.
 	fill()
@@ -158,15 +159,15 @@ func (interp *Interpreter) scanStream(r io.Reader, filename string) {
 			continue
 		}
 
-		// Try every rule at the current position.
+		// Single NFA pass over all rules at the current position.
 		fired := false
-		for _, rule := range rules {
-			adv, ok := interp.tryRule(rule, buf, pos, eof)
-			if ok {
-				pos += adv
-				fired = true
-				break
-			}
+		adv, entry, ms, ok := cn.tryAt(buf, pos, eof)
+		if ok {
+			interp.pushMatch(ms)
+			interp.execAction(entry.rule.Action, interp.global)
+			interp.popMatch()
+			pos += adv
+			fired = true
 		}
 
 		if fired {
@@ -180,9 +181,9 @@ func (interp *Interpreter) scanStream(r io.Reader, filename string) {
 		// before concluding this position is unmatched.
 		//
 		// "continue" unconditionally after fill() because fill() may
-		// have added 0 bytes but flipped eof=true — in that case tryRule
-		// needs another shot with the updated eof flag so the bare-block
-		// EOF path (no trailing newline) can fire.
+		// have added 0 bytes but flipped eof=true — tryAt needs another
+		// shot with the updated eof flag so the bare-block EOF path
+		// (no trailing newline) can fire.
 		if !eof {
 			fill()
 			continue
@@ -197,56 +198,6 @@ func (interp *Interpreter) scanStream(r io.Reader, filename string) {
 	}
 }
 
-// tryRule attempts to match rule at buf[pos:].
-// Returns (advance, true) on success (action has been executed).
-// Returns (0, false) if the rule does not match.
-func (interp *Interpreter) tryRule(rule *Rule, buf []byte, pos int, eof bool) (int, bool) {
-	slice := buf[pos:]
-
-	if rule.Regex == "" {
-		// Implicit bare-block rule: /[^\n]*\n/ semantics.
-		// $0 = line WITHOUT trailing newline (AWK compat: { print $0 } prints cleanly).
-		nl := bytes.IndexByte(slice, '\n')
-		if nl < 0 {
-			// No newline found.
-			if !eof || len(slice) == 0 {
-				// Not at EOF, or nothing to consume.
-				return 0, false
-			}
-			// EOF with no trailing newline: treat remaining bytes as last line.
-			interp.pushMatch(MatchState{Text: string(slice)})
-			interp.execAction(rule.Action, interp.global)
-			interp.popMatch()
-			return len(slice), true
-		}
-		// Strip the newline: $0 = line (no \n), advance past the \n.
-		interp.pushMatch(MatchState{Text: string(slice[:nl])})
-		interp.execAction(rule.Action, interp.global)
-		interp.popMatch()
-		return nl + 1, true
-	}
-
-	// Explicit /Regex/ rule: anchored x-expression.
-	// Compile with (?s) so . matches \n (dot-all mode).
-	re := compileDotAll(rule.Regex)
-	m := re.FindSubmatchIndex(slice)
-	if m == nil || m[0] != 0 {
-		return 0, false
-	}
-
-	// Build match state from capture groups.
-	ms := matchStateFromRegex(re, string(slice), m)
-	interp.pushMatch(ms)
-	interp.execAction(rule.Action, interp.global)
-	interp.popMatch()
-	// Commit: advance by match length regardless of action.
-	// Zero-length match advances by 1 to avoid infinite loop.
-	adv := m[1]
-	if adv == 0 {
-		adv = 1
-	}
-	return adv, true
-}
 
 // reCache memoises compiled regexes so we pay the compilation cost once per
 // unique pattern string rather than once per stream position per rule.
