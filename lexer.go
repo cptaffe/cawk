@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"strings"
 	"unicode"
@@ -10,29 +11,33 @@ import (
 // stateFn represents the state of the scanner as a function that returns the next state.
 type stateFn func(*lexer) stateFn
 
-// lexer holds the state of the scanner. Uses Rob Pike's state-function architecture
-// from https://go.dev/talks/2011/lex.slide
+// lexer holds the state of the scanner.  Follows Rob Pike's state-function
+// architecture (https://go.dev/talks/2011/lex.slide).
+//
+// Input is consumed via a *bufio.Reader.  peek() reads ahead using
+// bufio.Reader.Peek + utf8.DecodeRune rather than the consume-then-backup
+// idiom, so it never disturbs the reader position.  Consumed runes accumulate
+// in buf; emit() drains buf to build the token value.
 type lexer struct {
-	name      string    // for error messages
-	input     string    // the string being scanned
-	start     int       // start position of this item
-	pos       int       // current position in the input
-	width     int       // width of last rune read
-	line      int       // 1-based line number at start
-	startLine int       // line number at item start
-	items     chan item  // channel of scanned items
-	lastType  itemType  // type of the last emitted item (for newline insertion)
-	parenDepth int      // nesting depth of (), [], {}
+	name       string
+	input      *bufio.Reader
+	buf        strings.Builder // runes consumed since the last emit/ignore
+	width      int             // byte-width of the last rune returned by next()
+	line       int             // current 1-based line number
+	startLine  int             // line number at the start of the current token
+	items      chan item
+	lastType   itemType
+	parenDepth int
 }
 
-// eof is a sentinel rune to signal end of input.
+// eof is a sentinel rune signalling end of input.
 const eof = -1
 
 // lex creates a new scanner for the input string.
 func lex(name, input string) *lexer {
 	l := &lexer{
 		name:  name,
-		input: input,
+		input: bufio.NewReader(strings.NewReader(input)),
 		line:  1,
 		items: make(chan item, 2),
 	}
@@ -40,7 +45,6 @@ func lex(name, input string) *lexer {
 	return l
 }
 
-// run lexes the input by executing state functions until the state is nil.
 func (l *lexer) run() {
 	for state := lexStart; state != nil; {
 		state = state(l)
@@ -48,60 +52,71 @@ func (l *lexer) run() {
 	close(l.items)
 }
 
-// next returns the next rune in the input.
+// next consumes and returns the next rune.
 func (l *lexer) next() rune {
-	if l.pos >= len(l.input) {
+	r, w, err := l.input.ReadRune()
+	if err != nil {
 		l.width = 0
 		return eof
 	}
-	r, w := utf8.DecodeRuneInString(l.input[l.pos:])
 	l.width = w
-	l.pos += w
+	l.buf.WriteRune(r)
 	if r == '\n' {
 		l.line++
 	}
 	return r
 }
 
-// peek returns but does not consume the next rune in the input.
+// peek returns the next rune without consuming it.
+// It uses bufio.Reader.Peek + utf8.DecodeRune — no consume-then-backup cycle.
 func (l *lexer) peek() rune {
-	r := l.next()
-	l.backup()
+	bs, _ := l.input.Peek(utf8.UTFMax)
+	if len(bs) == 0 {
+		return eof
+	}
+	r, _ := utf8.DecodeRune(bs)
 	return r
 }
 
-// backup steps back one rune.  Can be called only once per call of next.
+// backup steps back one rune.  May only be called once per call to next.
 func (l *lexer) backup() {
-	l.pos -= l.width
-	if l.width > 0 && l.input[l.pos] == '\n' {
+	if l.width == 0 {
+		return
+	}
+	l.input.UnreadRune()
+	s := l.buf.String()
+	r, _ := utf8.DecodeLastRuneInString(s)
+	if r == '\n' {
 		l.line--
 	}
+	l.buf.Reset()
+	l.buf.WriteString(s[:len(s)-l.width])
+	l.width = 0
 }
 
-// emit passes an item back to the client.
+// emit passes an item whose value is everything consumed since the last emit.
 func (l *lexer) emit(t itemType) {
-	l.items <- item{t, l.input[l.start:l.pos], l.start, l.startLine}
+	l.items <- item{t, l.buf.String(), l.startLine}
 	l.lastType = t
-	l.start = l.pos
+	l.buf.Reset()
 	l.startLine = l.line
 }
 
-// emitVal passes an item with an explicit value back to the client.
+// emitVal passes an item with an explicit value (discards buf).
 func (l *lexer) emitVal(t itemType, val string) {
-	l.items <- item{t, val, l.start, l.startLine}
+	l.items <- item{t, val, l.startLine}
 	l.lastType = t
-	l.start = l.pos
+	l.buf.Reset()
 	l.startLine = l.line
 }
 
-// ignore skips over the pending input before this point.
+// ignore discards everything consumed since the last emit.
 func (l *lexer) ignore() {
-	l.line += strings.Count(l.input[l.start:l.pos], "\n")
-	l.start = l.pos
+	l.buf.Reset()
 	l.startLine = l.line
 }
 
-// accept consumes the next rune if it's from the valid set.
+// accept consumes the next rune if it is in the valid set.
 func (l *lexer) accept(valid string) bool {
 	if strings.ContainsRune(valid, l.next()) {
 		return true
@@ -117,9 +132,9 @@ func (l *lexer) acceptRun(valid string) {
 	l.backup()
 }
 
-// errorf returns an error token and terminates the scan.
+// errorf emits an error token and stops the scan.
 func (l *lexer) errorf(format string, args ...interface{}) stateFn {
-	l.items <- item{itemError, fmt.Sprintf(format, args...), l.start, l.startLine}
+	l.items <- item{itemError, fmt.Sprintf(format, args...), l.startLine}
 	return nil
 }
 
@@ -128,12 +143,13 @@ func (l *lexer) nextItem() item {
 	return <-l.items
 }
 
-// peekNonSpace returns the first non-whitespace character at or after pos,
-// without consuming any input. Used for lookahead decisions.
+// peekNonSpace returns the first non-whitespace rune ahead in the unread
+// portion of the input, without consuming anything.
 func (l *lexer) peekNonSpace() rune {
-	i := l.pos
-	for i < len(l.input) {
-		r, w := utf8.DecodeRuneInString(l.input[i:])
+	bs, _ := l.input.Peek(256)
+	i := 0
+	for i < len(bs) {
+		r, w := utf8.DecodeRune(bs[i:])
 		if r != ' ' && r != '\t' && r != '\r' {
 			return r
 		}
@@ -142,8 +158,8 @@ func (l *lexer) peekNonSpace() rune {
 	return eof
 }
 
-// shouldInsertNewline returns true if a significant newline should be emitted
-// based on the last emitted token type.
+// shouldInsertNewline reports whether a significant newline should follow the
+// last emitted token.
 func (l *lexer) shouldInsertNewline() bool {
 	switch l.lastType {
 	case itemIdent, itemNumber, itemString, itemRegex,
@@ -184,7 +200,6 @@ func lexStart(l *lexer) stateFn {
 		return lexStart
 
 	case r == '\\' && l.peek() == '\n':
-		// line continuation: backslash-newline is ignored
 		l.next() // consume the newline
 		l.ignore()
 		return lexStart
@@ -194,7 +209,6 @@ func lexStart(l *lexer) stateFn {
 		return lexStart
 
 	case r == '#':
-		// comment: skip to end of line
 		for l.peek() != '\n' && l.peek() != eof {
 			l.next()
 		}
@@ -205,8 +219,6 @@ func lexStart(l *lexer) stateFn {
 		return lexString
 
 	case r == '/':
-		// Could be a regex, division, or //comment (not standard awk but handle /= )
-		// Division comes after a "value" token; regex comes after operators, etc.
 		if l.isDivision() {
 			if l.peek() == '=' {
 				l.next()
@@ -219,7 +231,6 @@ func lexStart(l *lexer) stateFn {
 		return lexRegex
 
 	case r == '`':
-		// Not standard AWK; treat as raw string (no escapes)
 		return lexRawString
 
 	case isDigit(r) || (r == '.' && isDigit(l.peek())):
@@ -240,7 +251,6 @@ func lexStart(l *lexer) stateFn {
 		} else {
 			l.emitVal(itemPlus, "+")
 		}
-		return lexStart
 
 	case r == '-':
 		if l.peek() == '-' {
@@ -252,14 +262,12 @@ func lexStart(l *lexer) stateFn {
 		} else {
 			l.emitVal(itemMinus, "-")
 		}
-		return lexStart
 
 	case r == '*':
 		if l.peek() == '=' {
 			l.next()
 			l.emit(itemMulAssign)
 		} else if l.peek() == '*' {
-			// ** is power in some awks
 			l.next()
 			if l.peek() == '=' {
 				l.next()
@@ -270,7 +278,6 @@ func lexStart(l *lexer) stateFn {
 		} else {
 			l.emitVal(itemStar, "*")
 		}
-		return lexStart
 
 	case r == '%':
 		if l.peek() == '=' {
@@ -279,7 +286,6 @@ func lexStart(l *lexer) stateFn {
 		} else {
 			l.emitVal(itemPercent, "%")
 		}
-		return lexStart
 
 	case r == '^':
 		if l.peek() == '=' {
@@ -288,7 +294,6 @@ func lexStart(l *lexer) stateFn {
 		} else {
 			l.emit(itemPow)
 		}
-		return lexStart
 
 	case r == '!':
 		if l.peek() == '=' {
@@ -300,11 +305,9 @@ func lexStart(l *lexer) stateFn {
 		} else {
 			l.emitVal(itemBang, "!")
 		}
-		return lexStart
 
 	case r == '~':
 		l.emit(itemMatch)
-		return lexStart
 
 	case r == '<':
 		if l.peek() == '=' {
@@ -313,7 +316,6 @@ func lexStart(l *lexer) stateFn {
 		} else {
 			l.emitVal(itemLT, "<")
 		}
-		return lexStart
 
 	case r == '>':
 		if l.peek() == '>' {
@@ -325,7 +327,6 @@ func lexStart(l *lexer) stateFn {
 		} else {
 			l.emitVal(itemGT, ">")
 		}
-		return lexStart
 
 	case r == '=':
 		if l.peek() == '=' {
@@ -334,17 +335,14 @@ func lexStart(l *lexer) stateFn {
 		} else {
 			l.emitVal(itemType('='), "=")
 		}
-		return lexStart
 
 	case r == '&':
 		if l.peek() == '&' {
 			l.next()
 			l.emit(itemAnd)
 		} else {
-			// single & is not standard awk; error or treat as bitwise (gawk)
 			l.emitVal(itemType('&'), "&")
 		}
-		return lexStart
 
 	case r == '|':
 		if l.peek() == '|' {
@@ -356,81 +354,63 @@ func lexStart(l *lexer) stateFn {
 		} else {
 			l.emitVal(itemPipe, "|")
 		}
-		return lexStart
 
 	case r == '(':
 		l.parenDepth++
 		l.emitVal(itemLParen, "(")
-		return lexStart
 
 	case r == ')':
 		l.parenDepth--
 		l.emit(itemRParen)
-		return lexStart
 
 	case r == '[':
 		l.parenDepth++
 		l.emitVal(itemLBracket, "[")
-		return lexStart
 
 	case r == ']':
 		l.parenDepth--
 		l.emit(itemRBracket)
-		return lexStart
 
 	case r == '{':
 		l.parenDepth++
 		l.emitVal(itemLBrace, "{")
-		return lexStart
 
 	case r == '}':
 		l.parenDepth--
 		l.emit(itemRBrace)
-		return lexStart
 
 	case r == ';':
 		l.emit(itemSemicolon)
-		return lexStart
 
 	case r == ',':
 		l.emitVal(itemComma, ",")
-		return lexStart
 
 	case r == '$':
-		// $name → itemNamedGroupRef (named capture group reference).
-		// $digit or $expr → itemDollar (positional field).
-		if p := l.peek(); isAlpha(p) {
+		if isAlpha(l.peek()) {
 			l.next() // consume first letter
-			for {
-				r2 := l.peek()
-				if isAlpha(r2) || isDigit(r2) {
-					l.next()
-				} else {
-					break
-				}
+			for isAlpha(l.peek()) || isDigit(l.peek()) {
+				l.next()
 			}
-			// val = name without the leading '$'
-			name := l.input[l.start+1 : l.pos]
-			l.emitVal(itemNamedGroupRef, name)
-			return lexStart
+			s := l.buf.String() // "$name"
+			l.emitVal(itemNamedGroupRef, s[1:])
+		} else {
+			l.emitVal(itemDollar, "$")
 		}
-		l.emitVal(itemDollar, "$")
-		return lexStart
 
 	case r == '?':
 		l.emitVal(itemQuestion, "?")
-		return lexStart
 
 	case r == ':':
 		l.emitVal(itemColon, ":")
-		return lexStart
 
 	default:
 		return l.errorf("unexpected character: %q", r)
 	}
+	return lexStart
 }
 
-// isDivision returns true if the current context means '/' is division (not regex start).
+// isDivision reports whether '/' in the current context is division rather
+// than the start of a regex literal.
 func (l *lexer) isDivision() bool {
 	switch l.lastType {
 	case itemIdent, itemNumber, itemString, itemRegex,
@@ -443,45 +423,31 @@ func (l *lexer) isDivision() bool {
 
 // lexIdentifier scans an alphanumeric identifier or keyword.
 func lexIdentifier(l *lexer) stateFn {
-	l.next() // consume first character (already checked isAlpha)
-	for {
-		r := l.peek()
-		if isAlpha(r) || isDigit(r) {
-			l.next()
-		} else {
-			break
-		}
+	l.next() // first character already validated as isAlpha by caller
+	for isAlpha(l.peek()) || isDigit(l.peek()) {
+		l.next()
 	}
-	word := l.input[l.start:l.pos]
+	word := l.buf.String()
 
-	// Check if it's a structural regex keyword (x, y, g, v followed by /)
+	// Structural keyword (e.g. "y") only when immediately followed (past
+	// optional whitespace) by "/" that is not "/=" or "//".
 	if st, ok := structuralKeywords[word]; ok {
-		// Look ahead past whitespace for /
-		rest := l.input[l.pos:]
+		bs, _ := l.input.Peek(256)
 		i := 0
-		for i < len(rest) && (rest[i] == ' ' || rest[i] == '\t') {
+		for i < len(bs) && (bs[i] == ' ' || bs[i] == '\t') {
 			i++
 		}
-		if i < len(rest) && rest[i] == '/' {
-			// Check it's not /= (divide-assign) or // (comment)
-			if i+1 < len(rest) && rest[i+1] != '=' && rest[i+1] != '/' {
-				l.emit(st)
-				return lexStart
-			}
-			if i+1 >= len(rest) {
-				// / at end of input: regex
-				l.emit(st)
-				return lexStart
-			}
+		if i < len(bs) && bs[i] == '/' &&
+			(i+1 >= len(bs) || (bs[i+1] != '=' && bs[i+1] != '/')) {
+			l.emit(st)
+			return lexStart
 		}
 	}
 
-	// Check keywords
 	if kw, ok := keywords[word]; ok {
 		l.emit(kw)
 		return lexStart
 	}
-
 	l.emit(itemIdent)
 	return lexStart
 }
@@ -489,13 +455,11 @@ func lexIdentifier(l *lexer) stateFn {
 // lexNumber scans a numeric literal.
 func lexNumber(l *lexer) stateFn {
 	digits := "0123456789"
-	l.accept("+-") // optional sign? No, signs are handled as unary ops in awk
 
-	// Check for hex
 	if l.accept("0") && l.accept("xX") {
 		digits = "0123456789abcdefABCDEF"
 		l.acceptRun(digits)
-		if !strings.ContainsAny(l.input[l.start:l.pos], "0123456789abcdefABCDEF") {
+		if !strings.ContainsAny(l.buf.String(), "0123456789abcdefABCDEF") {
 			return l.errorf("bad hex constant")
 		}
 		l.emit(itemNumber)
@@ -513,17 +477,15 @@ func lexNumber(l *lexer) stateFn {
 
 	if isAlpha(l.peek()) {
 		l.next()
-		return l.errorf("bad number syntax: %q", l.input[l.start:l.pos])
+		return l.errorf("bad number syntax: %q", l.buf.String())
 	}
-
 	l.emit(itemNumber)
 	return lexStart
 }
 
-// lexString scans a double-quoted string.
+// lexString scans a double-quoted string, processing escape sequences.
 func lexString(l *lexer) stateFn {
-	// Opening " already consumed.
-	var buf strings.Builder
+	var val strings.Builder
 	for {
 		r := l.next()
 		switch r {
@@ -533,41 +495,38 @@ func lexString(l *lexer) stateFn {
 			esc := l.next()
 			switch esc {
 			case 'n':
-				buf.WriteByte('\n')
+				val.WriteByte('\n')
 			case 't':
-				buf.WriteByte('\t')
+				val.WriteByte('\t')
 			case 'r':
-				buf.WriteByte('\r')
+				val.WriteByte('\r')
 			case 'a':
-				buf.WriteByte('\a')
+				val.WriteByte('\a')
 			case 'b':
-				buf.WriteByte('\b')
+				val.WriteByte('\b')
 			case 'f':
-				buf.WriteByte('\f')
+				val.WriteByte('\f')
 			case 'v':
-				buf.WriteByte('\v')
+				val.WriteByte('\v')
 			case '\\':
-				buf.WriteByte('\\')
+				val.WriteByte('\\')
 			case '"':
-				buf.WriteByte('"')
+				val.WriteByte('"')
 			case '/':
-				buf.WriteByte('/')
+				val.WriteByte('/')
 			case '0', '1', '2', '3', '4', '5', '6', '7':
-				// octal escape
 				oct := string(esc)
 				for i := 0; i < 2; i++ {
-					r2 := l.peek()
-					if r2 >= '0' && r2 <= '7' {
+					if r2 := l.peek(); r2 >= '0' && r2 <= '7' {
 						oct += string(l.next())
 					} else {
 						break
 					}
 				}
-				var val int
-				fmt.Sscanf(oct, "%o", &val)
-				buf.WriteByte(byte(val))
+				var v int
+				fmt.Sscanf(oct, "%o", &v)
+				val.WriteByte(byte(v))
 			case 'x':
-				// hex escape
 				hex := ""
 				for i := 0; i < 2; i++ {
 					r2 := l.peek()
@@ -578,21 +537,21 @@ func lexString(l *lexer) stateFn {
 					}
 				}
 				if hex != "" {
-					var val int
-					fmt.Sscanf(hex, "%x", &val)
-					buf.WriteByte(byte(val))
+					var v int
+					fmt.Sscanf(hex, "%x", &v)
+					val.WriteByte(byte(v))
 				} else {
-					buf.WriteByte('x')
+					val.WriteByte('x')
 				}
 			default:
-				buf.WriteByte('\\')
-				buf.WriteRune(esc)
+				val.WriteByte('\\')
+				val.WriteRune(esc)
 			}
 		case '"':
-			l.emitVal(itemString, buf.String())
+			l.emitVal(itemString, val.String())
 			return lexStart
 		default:
-			buf.WriteRune(r)
+			val.WriteRune(r)
 		}
 	}
 }
@@ -600,21 +559,20 @@ func lexString(l *lexer) stateFn {
 // lexRawString scans a backtick-quoted raw string (no escape processing).
 func lexRawString(l *lexer) stateFn {
 	for {
-		r := l.next()
-		switch r {
+		switch l.next() {
 		case eof:
 			return l.errorf("unterminated raw string")
 		case '`':
-			l.emitVal(itemString, l.input[l.start+1:l.pos-1])
+			s := l.buf.String() // "`content`"
+			l.emitVal(itemString, s[1:len(s)-1])
 			return lexStart
 		}
 	}
 }
 
-// lexRegex scans a regex literal /pattern/.
-// The opening / has already been consumed.
+// lexRegex scans a regex literal /pattern/ (opening / already consumed).
 func lexRegex(l *lexer) stateFn {
-	var buf strings.Builder
+	var val strings.Builder
 	for {
 		r := l.next()
 		switch r {
@@ -623,24 +581,19 @@ func lexRegex(l *lexer) stateFn {
 		case '\\':
 			next := l.next()
 			if next == '/' {
-				buf.WriteByte('/')
+				val.WriteByte('/')
 			} else {
-				buf.WriteByte('\\')
-				buf.WriteRune(next)
+				val.WriteByte('\\')
+				val.WriteRune(next)
 			}
 		case '/':
-			l.emitVal(itemRegex, buf.String())
+			l.emitVal(itemRegex, val.String())
 			return lexStart
 		default:
-			buf.WriteRune(r)
+			val.WriteRune(r)
 		}
 	}
 }
 
-func isAlpha(r rune) bool {
-	return r == '_' || unicode.IsLetter(r)
-}
-
-func isDigit(r rune) bool {
-	return r >= '0' && r <= '9'
-}
+func isAlpha(r rune) bool { return r == '_' || unicode.IsLetter(r) }
+func isDigit(r rune) bool { return r >= '0' && r <= '9' }

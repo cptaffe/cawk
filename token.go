@@ -90,8 +90,7 @@ const (
 // item represents a token returned from the scanner.
 type item struct {
 	typ  itemType // The type of this item.
-	val  string   // The value of this item (slice of input).
-	pos  int      // The position of this item in the input.
+	val  string   // The value of this item.
 	line int      // The line number of this item.
 }
 
