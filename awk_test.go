@@ -549,3 +549,48 @@ func TestCounterInBlock(t *testing.T) {
 		runCawk(t, `BEGIN{n=0} {n++; if(n==2){print "second:", $0}}`, "x\ny\nz\n"),
 		"second: y\n")
 }
+
+// ─── Regression: bug.md — top-level /re/ must match literal \n ───────────────
+//
+// Old cawk treated top-level /re/ as an expression pattern evaluated against
+// $0 (line without trailing newline), so /hello\n/ never matched.  New cawk
+// uses x-expression semantics: the pattern is anchored against the raw stream,
+// so /hello\n/ correctly consumes "hello\n" as a single token.
+
+// Exact reproduction from bug.md: /hello\n/ fires; /^hello$/ does not.
+// In old cawk: only "matched without newline" printed (and twice, due to
+// expression-pattern line-based evaluation matching both "hello" and "world").
+// In new cawk: "matched with newline" printed once; /^hello$/ never fires
+// ($ is end-of-stream in x-expression mode, not end-of-line).
+func TestBugNewlineInTopLevelPattern(t *testing.T) {
+	check(t, "bug: /hello\\n/ matches (x-expression)",
+		runCawk(t, `/hello\n/ { print "matched with newline" } /^hello$/ { print "matched without newline" }`,
+			"hello\nworld\n"),
+		"matched with newline\n")
+}
+
+// $0 includes the newline when /re\n/ is the matching pattern.
+func TestBugDollarZeroIncludesNewline(t *testing.T) {
+	check(t, "bug: $0 includes matched newline",
+		runCawk(t, `/hello\n/ { printf "|%s|", $0 }`, "hello\n"),
+		"|hello\n|")
+}
+
+// The hotkeys idiom: /event\n/ consumes the line; printf "!%s",$0 re-emits
+// with a leading "!" and no double-newline (since $0 already contains \n).
+// Unmatched lines fall to the bare-block catch-all, which strips the newline
+// and re-adds it via ORS — producing clean output.
+func TestBugEventDispatchPattern(t *testing.T) {
+	check(t, "bug: hotkeys event dispatch with \\n pattern",
+		runCawk(t, `/command s\n/ { printf "!%s", $0 } { print $0 }`,
+			"command s\nrepeat command s\nshift a\n"),
+		"!command s\nrepeat command s\nshift a\n")
+}
+
+// Multi-line x-expression: /foo\nbar\n/ matches two consecutive lines atomically.
+func TestBugMultilineXExpr(t *testing.T) {
+	check(t, "bug: multi-line pattern spans record boundary",
+		runCawk(t, `/foo\nbar\n/ { print "chord" } { print $0 }`,
+			"foo\nbar\nbaz\n"),
+		"chord\nbaz\n")
+}
