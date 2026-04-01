@@ -6,6 +6,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -119,13 +120,26 @@ func main() {
 		os.Exit(1)
 	}
 
-	prog, err := parseProgram("<input>", progSource)
+	exitCode, err := run(progSource, os.Stdin, os.Stdout, assigns, files)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cawk: %v\n", err)
 		os.Exit(2)
 	}
+	os.Exit(exitCode)
+}
+
+// run parses and executes a cawk program, reading from stdin and writing to
+// stdout.  It returns the exit code and any parse or runtime error.
+// Extracted from main so tests can call it directly without a subprocess.
+func run(progSource string, stdin io.Reader, stdout io.Writer, assigns, files []string) (int, error) {
+	prog, err := parseProgram("<input>", progSource)
+	if err != nil {
+		return 2, err
+	}
 
 	interp := newInterpreter(prog)
+	interp.Stdin = stdin
+	interp.Stdout = stdout
 
 	// ARGC/ARGV
 	interp.ARGC = float64(len(files) + 1)
@@ -150,17 +164,16 @@ func main() {
 	for _, a := range assigns {
 		parts := strings.SplitN(a, "=", 2)
 		if len(parts) != 2 {
-			die("bad assignment: %s", a)
+			return 1, fmt.Errorf("bad assignment: %s", a)
 		}
 		v := numStr(parts[1])
 		interp.setVar(parts[0], v, interp.global)
 	}
 
 	if err := interp.Run(files); err != nil {
-		fmt.Fprintf(os.Stderr, "cawk: %v\n", err)
-		os.Exit(1)
+		return 1, err
 	}
-	os.Exit(interp.exitStatus)
+	return interp.exitStatus, nil
 }
 
 func die(format string, args ...interface{}) {

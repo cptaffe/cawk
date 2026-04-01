@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"math"
 	"regexp"
 	"sort"
@@ -109,6 +110,10 @@ type Interpreter struct {
 	FILENAME string
 	ARGC     float64
 	ARGV     map[string]*Value
+
+	// I/O — defaults to os.Stdin/os.Stdout but swappable for tests.
+	Stdin  io.Reader
+	Stdout io.Writer
 
 	// Output
 	files map[string]interface{}

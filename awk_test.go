@@ -3,24 +3,29 @@ package main
 import (
 	"io"
 	"os"
-	"os/exec"
 	"strings"
 	"testing"
 )
 
-// runCawk runs a cawk program against input and returns stdout.
+// runCawk runs a cawk program against input in-process and returns stdout.
+// Extra args may be -v var=val assignments.
 func runCawk(t *testing.T, prog, input string, args ...string) string {
 	t.Helper()
-	cmd := exec.Command("./cawk", append([]string{prog}, args...)...)
-	cmd.Stdin = strings.NewReader(input)
-	out, err := cmd.Output()
-	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			t.Logf("stderr: %s", ee.Stderr)
+	var assigns []string
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "-v" && i+1 < len(args):
+			assigns = append(assigns, args[i+1])
+			i++
+		case strings.HasPrefix(args[i], "-v"):
+			assigns = append(assigns, args[i][2:])
 		}
-		t.Fatalf("cawk error: %v", err)
 	}
-	return string(out)
+	var out strings.Builder
+	if _, err := run(prog, strings.NewReader(input), &out, assigns, nil); err != nil {
+		t.Fatalf("cawk: %v", err)
+	}
+	return out.String()
 }
 
 func check(t *testing.T, name, got, want string) {
@@ -28,17 +33,6 @@ func check(t *testing.T, name, got, want string) {
 	if got != want {
 		t.Errorf("%s:\ngot:  %q\nwant: %q", name, got, want)
 	}
-}
-
-// Build the binary once before all tests.
-func TestMain(m *testing.M) {
-	cmd := exec.Command("go", "build", "-o", "cawk", ".")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		os.Exit(1)
-	}
-	os.Exit(m.Run())
 }
 
 // ─── 5.1  Stream scanner: /re/ is x-expression ───────────────────────────────
@@ -568,43 +562,22 @@ func TestCounterInBlock(t *testing.T) {
 // immediately, then closes the pipe — if the rule needed a second line first,
 // Wait() would time out (or no output would arrive before close).
 func TestNewlinePatternNoLookaheadLatency(t *testing.T) {
-	cmd := exec.Command("./cawk", `/command s\n/ { printf "got:%s", $0 } { print "other:", $0 }`)
-
-	pr, pw, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	cmd.Stdin = pr
-
-	out, err := cmd.StdoutPipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := cmd.Start(); err != nil {
-		pw.Close()
-		pr.Close()
-		t.Fatal(err)
-	}
-	pr.Close() // child owns the read end
-
-	// Write exactly one matching event and close stdin immediately.
-	// If the rule requires a second line (old bug), the output "got:…"
-	// will never arrive before EOF — in practice the rule would stall on
-	// a real pipe.  After the close the child sees EOF and flushes, so
-	// either way Wait returns; we just check the output is correct.
-	if _, err := pw.WriteString("command s\n"); err != nil {
-		t.Fatal(err)
-	}
+	// Verify that /re\n/ fires as soon as the matching line arrives, without
+	// requiring a second line.  Use an io.Pipe so the scanner sees a live
+	// reader (not a bytes.Reader already at EOF).
+	pr, pw := io.Pipe()
+	var out strings.Builder
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		run(`/command s\n/ { printf "got:%s", $0 } { print "other:", $0 }`,
+			pr, &out, nil, nil)
+	}()
+	io.WriteString(pw, "command s\n")
 	pw.Close()
-
-	var buf strings.Builder
-	io.Copy(&buf, out)
-	if err := cmd.Wait(); err != nil {
-		t.Fatalf("cawk exited with error: %v", err)
-	}
-
+	<-done
 	check(t, "newline-pattern fires on single event (no latency)",
-		buf.String(), "got:command s\n")
+		out.String(), "got:command s\n")
 }
 
 // ─── Regression: bug.md — top-level /re/ must match literal \n ───────────────

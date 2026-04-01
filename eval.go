@@ -15,6 +15,20 @@ import (
 // exitSignal is panicked to implement exit.
 type exitSignal struct{ code int }
 
+func (interp *Interpreter) stdout() io.Writer {
+	if interp.Stdout != nil {
+		return interp.Stdout
+	}
+	return os.Stdout
+}
+
+func (interp *Interpreter) stdin() io.Reader {
+	if interp.Stdin != nil {
+		return interp.Stdin
+	}
+	return os.Stdin
+}
+
 // --- Entry point ---
 
 func (interp *Interpreter) Run(files []string) error {
@@ -49,11 +63,11 @@ func (interp *Interpreter) Run(files []string) error {
 	if !exited {
 		exited = runPhase(func() {
 			if len(files) == 0 {
-				interp.scanStream(os.Stdin, "-")
+				interp.scanStream(interp.stdin(), "-")
 			} else {
 				for _, f := range files {
 					if f == "-" {
-						interp.scanStream(os.Stdin, "-")
+						interp.scanStream(interp.stdin(), "-")
 					} else {
 						fh, err := os.Open(f)
 						if err != nil {
@@ -965,7 +979,7 @@ func sprintfAWK(format string, args []interface{}, ofmt string) string {
 
 func (interp *Interpreter) getOutput(redir *Redirect, scope *Scope) io.Writer {
 	if redir == nil {
-		return os.Stdout
+		return interp.stdout()
 	}
 	dest := interp.evalExpr(redir.Dest, scope).toString()
 	key := redir.Mode + ":" + dest
@@ -998,7 +1012,7 @@ func (interp *Interpreter) getOutput(redir *Redirect, scope *Scope) io.Writer {
 			interp.files[key] = pw
 		}
 	default:
-		w = os.Stdout
+		w = interp.stdout()
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cawk: cannot open %s: %v\n", dest, err)
@@ -1038,8 +1052,8 @@ func (interp *Interpreter) getFileReader(filename string) io.Reader {
 		return r.(io.Reader)
 	}
 	if filename == "-" {
-		interp.files[key] = os.Stdin
-		return os.Stdin
+		interp.files[key] = interp.stdin()
+		return interp.stdin()
 	}
 	f, err := os.Open(filename)
 	if err != nil {
